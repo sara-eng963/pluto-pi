@@ -3,59 +3,75 @@
 """
 navigation_node.py
 
-Stage 3 Pi-side navigation node.
+Interactive coordinate-based Manhattan navigation node.
 
 Purpose:
-    Convert a target coordinate (x, y, yaw) into Manhattan-style drive commands.
+    Let the user type a target coordinate in the terminal:
+
+        nav> 1 1 90
+
+    Meaning:
+        Go to x = 1 m
+        Go to y = 1 m
+        End at yaw = 90 deg
 
 Architecture:
     Raspberry Pi:
         - Stores the robot's logical current pose: x, y, yaw
-        - Receives target coordinate
-        - Generates ROTATE/MOVE command sequence
-        - Sends commands one by one to ESP
-        - Waits for DONE before sending next command
-        - Updates current pose only after successful arrival
+        - Converts target pose into ROTATE/MOVE commands
+        - Sends commands one by one to ESP through /drive_cmd
+        - Waits for ACK and DONE from /drive_status
+        - Updates current pose only after full successful navigation
 
     ESP32:
-        - Receives simple commands:
+        - Receives low-level movement commands:
             ROTATE <heading_deg>
             MOVE <distance_m> <heading_deg>
             STOP
             STATUS
-        - Handles real motor control, encoders, PID, and IMU yaw
-        - Publishes ACK / DONE / FAULT responses
+        - Handles IMU, encoders, PID, motor control
+        - Publishes:
+            ACK ...
+            DONE ...
+            FAULT ...
+            STATUS ...
 
 Coordinate convention:
-    0 deg    = +X direction
-    180 deg  = -X direction
-    90 deg   = +Y direction
-    -90 deg  = -Y direction
+    0 deg    = +X
+    180 deg  = -X
+    90 deg   = +Y
+    -90 deg  = -Y
 
 Example:
     Current pose:
-        (0, 0, 0)
+        x = 0, y = 0, yaw = 0
 
-    Target:
-        (1, 1, 90)
+    User types:
+        nav> 1 1 90
 
-    Generated commands:
+    Generated sequence:
         ROTATE 0
         MOVE 1.00 0
         ROTATE 90
         MOVE 1.00 90
         ROTATE 90
+
+    After success:
+        current_pose = (1, 1, 90)
 """
 
-import argparse
 import time
 from dataclasses import dataclass
-from typing import List
+from typing import List, Union
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
+
+# =============================================================================
+# DATA STRUCTURE
+# =============================================================================
 
 @dataclass
 class Pose2D:
@@ -63,17 +79,18 @@ class Pose2D:
     Simple 2D pose.
 
     x:
-        Position on X axis in meters.
+        X position in meters.
 
     y:
-        Position on Y axis in meters.
+        Y position in meters.
 
     yaw:
-        Robot orientation in degrees.
+        Orientation in degrees.
 
     Important:
-        This is the Pi's logical pose estimate.
-        The ESP still uses the IMU internally to execute ROTATE commands.
+        This pose is the Pi's logical estimate.
+        For now, we assume that if ESP says DONE MOVE, the robot reached that
+        commanded distance correctly.
     """
 
     x: float
@@ -81,30 +98,44 @@ class Pose2D:
     yaw: float
 
 
+# =============================================================================
+# NAVIGATION NODE
+# =============================================================================
+
 class NavigationNode(Node):
     """
-    Coordinate-based Manhattan navigation node.
+    Interactive Manhattan navigation node.
 
     Publishes:
         /drive_cmd      std_msgs/msg/String
 
     Subscribes:
         /drive_status   std_msgs/msg/String
-
-    This node converts:
-        target_x, target_y, target_yaw
-
-    Into:
-        ROTATE/MOVE/ROTATE/MOVE/ROTATE command sequence.
     """
 
     def __init__(self, current_pose: Pose2D, position_tolerance: float = 0.03):
         super().__init__("navigation_node")
 
-        # Publisher to ESP drive command topic.
+        # ---------------------------------------------------------------------
+        # ROS publisher to ESP
+        # ---------------------------------------------------------------------
+        # This sends commands like:
+        #   ROTATE 90
+        #   MOVE 0.30 90
+        #   STOP
+        #   STATUS
         self.cmd_pub = self.create_publisher(String, "/drive_cmd", 10)
 
-        # Subscriber to ESP response/status topic.
+        # ---------------------------------------------------------------------
+        # ROS subscriber from ESP
+        # ---------------------------------------------------------------------
+        # This receives responses like:
+        #   ACK ROTATE heading=90.0
+        #   DONE ROTATE
+        #   ACK MOVE distance=0.30 heading=90.0
+        #   DONE MOVE
+        #   STATUS ...
+        #   FAULT TIMEOUT
         self.status_sub = self.create_subscription(
             String,
             "/drive_status",
@@ -112,47 +143,40 @@ class NavigationNode(Node):
             10,
         )
 
-        # Logical current pose stored by the Pi.
+        # Logical robot pose stored by the Pi.
         #
-        # For now, this is initialized manually.
-        # Later, this could come from odometry/localization.
+        # This is updated only after a full navigation sequence succeeds.
         self.current_pose = current_pose
 
         # If dx or dy is smaller than this, skip that movement.
-        #
-        # Example:
-        #   If dx = 0.01 m and tolerance = 0.03 m,
-        #   do not generate a MOVE command.
         self.position_tolerance = position_tolerance
 
-        # Latest ESP response string.
+        # Latest ESP message.
         self.last_status = ""
 
-        # Waiting flags.
+        # Response flags used while waiting for ESP.
         self.ack_received = False
         self.done_received = False
         self.fault_received = False
 
-        # Expected DONE type for current command:
-        #   "MOVE"
-        #   "ROTATE"
+        # Expected DONE type for current command.
+        #
+        # If command is MOVE, expect DONE MOVE.
+        # If command is ROTATE, expect DONE ROTATE.
         self.expected_done_keyword = ""
 
         self.get_logger().info("Navigation node started.")
-        self.get_logger().info(
-            f"Initial pose: x={self.current_pose.x:.2f}, "
-            f"y={self.current_pose.y:.2f}, yaw={self.current_pose.yaw:.1f}"
-        )
+        self.log_current_pose()
 
     # -------------------------------------------------------------------------
-    # ROS CALLBACK
+    # CALLBACK FROM ESP
     # -------------------------------------------------------------------------
 
     def status_callback(self, msg: String):
         """
-        Called whenever ESP publishes a message on /drive_status.
+        Runs every time ESP publishes a message on /drive_status.
 
-        It classifies ESP messages into:
+        The callback classifies incoming messages into:
             ACK
             DONE
             FAULT / ERR
@@ -164,18 +188,22 @@ class NavigationNode(Node):
 
         self.get_logger().info(f"ESP: {text}")
 
+        # Command accepted.
         if text.startswith("ACK"):
             self.ack_received = True
             return
 
+        # STATUS is a valid immediate response, not a motion completion.
         if text.startswith("STATUS"):
             self.ack_received = True
             return
 
+        # STOP response may be "STOPPED" or similar.
         if text.startswith("STOP") or text.startswith("STOPPED"):
             self.ack_received = True
             return
 
+        # Motion completion.
         if text.startswith("DONE"):
             if self.expected_done_keyword:
                 if self.expected_done_keyword in text:
@@ -184,17 +212,20 @@ class NavigationNode(Node):
                 self.done_received = True
             return
 
+        # Error or fault.
         if text.startswith("FAULT") or text.startswith("ERR"):
             self.fault_received = True
             return
 
     # -------------------------------------------------------------------------
-    # BASIC COMMAND HANDLING
+    # BASIC COMMAND FUNCTIONS
     # -------------------------------------------------------------------------
 
     def reset_wait_flags(self):
         """
-        Reset command-response flags before sending a new command.
+        Clear previous command result flags.
+
+        This prevents old ACK/DONE messages from affecting the next command.
         """
 
         self.last_status = ""
@@ -205,19 +236,23 @@ class NavigationNode(Node):
 
     def publish_command(self, command: str):
         """
-        Publish one command string to the ESP.
+        Publish one command to ESP.
         """
 
+        command = command.strip()
+
+        if not command:
+            return
+
         msg = String()
-        msg.data = command.strip()
+        msg.data = command
 
         self.cmd_pub.publish(msg)
-
-        self.get_logger().info(f"SEND: {msg.data}")
+        self.get_logger().info(f"SEND: {command}")
 
     def send_stop(self):
         """
-        Send emergency STOP to ESP.
+        Send STOP to ESP.
         """
 
         self.get_logger().warn("Sending STOP.")
@@ -225,10 +260,8 @@ class NavigationNode(Node):
 
     def is_motion_command(self, command: str) -> bool:
         """
-        Check whether command requires DONE.
-
-        MOVE and ROTATE are motion commands.
-        STATUS and STOP are immediate commands.
+        MOVE and ROTATE require ACK then DONE.
+        Other commands only require an immediate response.
         """
 
         upper = command.strip().upper()
@@ -237,7 +270,7 @@ class NavigationNode(Node):
 
     def expected_done_from_command(self, command: str) -> str:
         """
-        Determine which DONE response should be expected.
+        Determine expected DONE type.
         """
 
         upper = command.strip().upper()
@@ -249,6 +282,10 @@ class NavigationNode(Node):
             return "ROTATE"
 
         return ""
+
+    # -------------------------------------------------------------------------
+    # WAIT FUNCTIONS
+    # -------------------------------------------------------------------------
 
     def wait_for_ack(self, timeout_sec: float) -> bool:
         """
@@ -264,7 +301,9 @@ class NavigationNode(Node):
                 return True
 
             if self.fault_received:
-                self.get_logger().error(f"ESP error while waiting for ACK: {self.last_status}")
+                self.get_logger().error(
+                    f"ESP error while waiting for ACK: {self.last_status}"
+                )
                 return False
 
             if time.time() - start_time > timeout_sec:
@@ -334,13 +373,13 @@ class NavigationNode(Node):
         """
         Send one ESP command and wait for the correct response.
 
-        Non-motion command:
+        Non-motion commands:
             STATUS
             STOP
 
             Wait for any response.
 
-        Motion command:
+        Motion commands:
             ROTATE
             MOVE
 
@@ -357,15 +396,24 @@ class NavigationNode(Node):
 
         self.publish_command(command)
 
+        # STATUS / STOP / tuning commands.
         if not self.is_motion_command(command):
-            return self.wait_for_any_response(timeout_sec=ack_timeout_sec)
+            got_response = self.wait_for_any_response(timeout_sec=ack_timeout_sec)
 
+            if not got_response:
+                self.get_logger().error(f"No ESP response for command: {command}")
+                return False
+
+            return True
+
+        # MOVE / ROTATE: first wait for ACK.
         got_ack = self.wait_for_ack(timeout_sec=ack_timeout_sec)
 
         if not got_ack:
             self.get_logger().error(f"No valid ACK for command: {command}")
             return False
 
+        # Then wait for DONE.
         got_done = self.wait_for_done(timeout_sec=motion_timeout_sec)
 
         if not got_done:
@@ -382,7 +430,7 @@ class NavigationNode(Node):
     @staticmethod
     def normalize_yaw_deg(yaw: float) -> float:
         """
-        Normalize yaw to the range [-180, 180].
+        Normalize yaw into [-180, 180].
 
         Examples:
             270  -> -90
@@ -400,18 +448,14 @@ class NavigationNode(Node):
 
     def manhattan_commands(self, target_pose: Pose2D) -> List[str]:
         """
-        Convert target pose into a Manhattan-style command sequence.
+        Convert target pose into Manhattan-style ROTATE/MOVE commands.
 
         Movement order:
-            1. Move along X axis
-            2. Move along Y axis
-            3. Rotate to final yaw
+            1. X movement
+            2. Y movement
+            3. Final yaw
 
-        The ESP command format is:
-            ROTATE <heading_deg>
-            MOVE <distance_m> <heading_deg>
-
-        Heading convention:
+        Coordinate convention:
             +X  -> 0 deg
             -X  -> 180 deg
             +Y  -> 90 deg
@@ -424,58 +468,57 @@ class NavigationNode(Node):
         dy = target_pose.y - self.current_pose.y
 
         self.get_logger().info(
-            f"Planning from x={self.current_pose.x:.2f}, y={self.current_pose.y:.2f}, "
+            f"Planning from x={self.current_pose.x:.2f}, "
+            f"y={self.current_pose.y:.2f}, "
             f"yaw={self.current_pose.yaw:.1f}"
         )
 
         self.get_logger().info(
-            f"Target x={target_pose.x:.2f}, y={target_pose.y:.2f}, "
+            f"Target x={target_pose.x:.2f}, "
+            f"y={target_pose.y:.2f}, "
             f"yaw={target_pose.yaw:.1f}"
         )
 
         self.get_logger().info(f"dx={dx:.2f}, dy={dy:.2f}")
 
-        # Move along X first.
+        # ---------------------------------------------------------------------
+        # X movement first
+        # ---------------------------------------------------------------------
         if abs(dx) > self.position_tolerance:
-            if dx > 0.0:
-                heading = 0.0
-            else:
-                heading = 180.0
-
+            heading = 0.0 if dx > 0.0 else 180.0
             distance = abs(dx)
 
             commands.append(f"ROTATE {heading:.0f}")
             commands.append(f"MOVE {distance:.2f} {heading:.0f}")
 
-        # Then move along Y.
+        # ---------------------------------------------------------------------
+        # Y movement second
+        # ---------------------------------------------------------------------
         if abs(dy) > self.position_tolerance:
-            if dy > 0.0:
-                heading = 90.0
-            else:
-                heading = -90.0
-
+            heading = 90.0 if dy > 0.0 else -90.0
             distance = abs(dy)
 
             commands.append(f"ROTATE {heading:.0f}")
             commands.append(f"MOVE {distance:.2f} {heading:.0f}")
 
-        # Finally face the requested final orientation.
+        # ---------------------------------------------------------------------
+        # Final orientation
+        # ---------------------------------------------------------------------
         final_yaw = self.normalize_yaw_deg(target_pose.yaw)
-
         commands.append(f"ROTATE {final_yaw:.0f}")
 
         return commands
 
     def execute_navigation_to(self, target_pose: Pose2D) -> bool:
         """
-        Generate Manhattan commands and execute them one by one.
+        Generate and execute the Manhattan command sequence.
 
-        If all commands succeed:
-            update current_pose to target_pose
+        If successful:
+            update current_pose = target_pose
 
-        If any command fails:
+        If failed:
             send STOP
-            do not update current_pose
+            keep old current_pose
         """
 
         commands = self.manhattan_commands(target_pose)
@@ -495,100 +538,229 @@ class NavigationNode(Node):
                 self.send_stop()
                 return False
 
-            # Small controlled pause between segments.
-            # This improves reliability and gives mechanics time to settle.
+            # Short controlled pause between commands.
+            # This improves reliability between motion segments.
             if self.is_motion_command(command):
                 time.sleep(0.5)
             else:
                 time.sleep(0.2)
 
-        # Only update pose after full sequence succeeds.
+        # Update logical pose only after full success.
         self.current_pose = Pose2D(
             x=target_pose.x,
             y=target_pose.y,
             yaw=self.normalize_yaw_deg(target_pose.yaw),
         )
 
+        self.get_logger().info("Navigation succeeded.")
+        self.log_current_pose()
+
+        return True
+
+    def log_current_pose(self):
+        """
+        Print current logical pose.
+        """
+
         self.get_logger().info(
-            f"Arrived. Updated current pose: "
+            f"Current logical pose: "
             f"x={self.current_pose.x:.2f}, "
             f"y={self.current_pose.y:.2f}, "
             f"yaw={self.current_pose.yaw:.1f}"
         )
 
-        return True
 
+# =============================================================================
+# TERMINAL INPUT PARSING
+# =============================================================================
 
-def parse_args():
+def parse_target_input(line: str) -> Union[Pose2D, str, None]:
     """
-    Parse command-line target pose.
+    Parse user terminal input.
 
-    Usage:
-        ros2 run pluto navigation_node.py -- 1 1 90
+    Valid coordinate input:
+        1 1 90
+        0.5 0.2 0
+        -0.3 1.2 -90
 
-    Meaning:
-        target_x = 1 m
-        target_y = 1 m
-        target_yaw = 90 deg
-
-    Optional current pose:
-        ros2 run pluto navigation_node.py -- 1 1 90 --current-x 0 --current-y 0 --current-yaw 0
+    Special commands:
+        status
+        stop
+        pose
+        home
+        help
+        exit
     """
 
-    parser = argparse.ArgumentParser(description="Coordinate-based Manhattan navigation node")
+    line = line.strip()
 
-    parser.add_argument("target_x", type=float, help="Target X position in meters")
-    parser.add_argument("target_y", type=float, help="Target Y position in meters")
-    parser.add_argument("target_yaw", type=float, help="Target final yaw in degrees")
+    if not line:
+        return None
 
-    parser.add_argument("--current-x", type=float, default=0.0, help="Initial/current X position")
-    parser.add_argument("--current-y", type=float, default=0.0, help="Initial/current Y position")
-    parser.add_argument("--current-yaw", type=float, default=0.0, help="Initial/current yaw angle")
+    lower = line.lower()
 
-    parser.add_argument(
-        "--position-tolerance",
-        type=float,
-        default=0.03,
-        help="Ignore dx/dy smaller than this value in meters",
-    )
+    if lower in ("exit", "quit", "q"):
+        return "EXIT"
 
-    args, _ = parser.parse_known_args()
+    if lower in ("help", "?"):
+        return "HELP"
 
-    return args
+    if lower in ("status", "s"):
+        return "STATUS"
 
+    if lower in ("stop", "emergency", "estop"):
+        return "STOP"
+
+    if lower in ("pose", "p"):
+        return "POSE"
+
+    if lower in ("home", "h"):
+        return Pose2D(0.0, 0.0, 0.0)
+
+    parts = line.split()
+
+    if len(parts) != 3:
+        raise ValueError("Expected format: x y yaw   Example: 1 1 90")
+
+    try:
+        x = float(parts[0])
+        y = float(parts[1])
+        yaw = float(parts[2])
+    except ValueError as exc:
+        raise ValueError("x, y, yaw must be numbers. Example: 1 1 90") from exc
+
+    return Pose2D(x=x, y=y, yaw=yaw)
+
+
+def print_help():
+    """
+    Print interactive usage help.
+    """
+
+    print()
+    print("Interactive navigation commands:")
+    print()
+    print("  x y yaw       navigate to target pose")
+    print("                example: 1 1 90")
+    print("                example: 0.3 0.3 90")
+    print()
+    print("  status        ask ESP for STATUS")
+    print("  pose          print current logical pose")
+    print("  home          navigate to 0 0 0")
+    print("  stop          send STOP to ESP")
+    print("  help          show this help")
+    print("  exit          quit")
+    print()
+    print("Coordinate convention:")
+    print("  0 deg    = +X")
+    print("  180 deg  = -X")
+    print("  90 deg   = +Y")
+    print("  -90 deg  = -Y")
+    print()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main(args=None):
     """
     Main entry point.
-    """
 
-    cli_args = parse_args()
+    Starts an interactive terminal prompt:
+
+        nav>
+
+    User types target coordinates manually.
+    """
 
     rclpy.init(args=args)
 
+    # Initial logical pose.
+    #
+    # Place the robot physically at HOME before starting the node.
+    #
+    # HOME:
+    #   x = 0
+    #   y = 0
+    #   yaw = 0
     current_pose = Pose2D(
-        x=cli_args.current_x,
-        y=cli_args.current_y,
-        yaw=cli_args.current_yaw,
-    )
-
-    target_pose = Pose2D(
-        x=cli_args.target_x,
-        y=cli_args.target_y,
-        yaw=cli_args.target_yaw,
+        x=0.0,
+        y=0.0,
+        yaw=0.0,
     )
 
     node = NavigationNode(
         current_pose=current_pose,
-        position_tolerance=cli_args.position_tolerance,
+        position_tolerance=0.03,
     )
 
-    # Give micro-ROS/ROS discovery a short moment.
+    # Give ROS/micro-ROS discovery a moment.
     time.sleep(2.0)
 
+    print_help()
+
     try:
+        # First check that ESP is alive.
         node.send_command_and_wait("STATUS")
-        node.execute_navigation_to(target_pose)
+
+        while rclpy.ok():
+            try:
+                line = input("nav> ").strip()
+            except EOFError:
+                break
+
+            if not line:
+                continue
+
+            try:
+                result = parse_target_input(line)
+            except ValueError as exc:
+                print(f"Invalid input: {exc}")
+                continue
+
+            if result is None:
+                continue
+
+            if result == "EXIT":
+                print("Exiting navigation node.")
+                break
+
+            if result == "HELP":
+                print_help()
+                continue
+
+            if result == "STATUS":
+                node.send_command_and_wait("STATUS")
+                continue
+
+            if result == "STOP":
+                node.send_stop()
+                continue
+
+            if result == "POSE":
+                node.log_current_pose()
+                continue
+
+            # At this point, result is a Pose2D target.
+            target_pose = result
+
+            print()
+            print(
+                f"Target received: "
+                f"x={target_pose.x:.2f}, "
+                f"y={target_pose.y:.2f}, "
+                f"yaw={target_pose.yaw:.1f}"
+            )
+
+            success = node.execute_navigation_to(target_pose)
+
+            if success:
+                print("Navigation succeeded.")
+            else:
+                print("Navigation failed.")
+
+            print()
 
     except KeyboardInterrupt:
         node.get_logger().warn("Keyboard interrupt detected. Sending STOP.")

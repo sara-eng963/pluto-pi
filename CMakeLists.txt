@@ -15,6 +15,7 @@ install(
     scripts/comm_test.py
     scripts/drive_client_node.py
     scripts/test_sequence_node.py
+    scripts/navigation_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 # Install launch files
