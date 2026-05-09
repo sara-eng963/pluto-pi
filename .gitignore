@@ -1,0 +1,31 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ROS / colcon cache if accidentally created here
+build/
+install/
+log/
+
+# Virtual environments
+.env
+venv/
+.venv/
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Runtime outputs
+yolo_results/
+*.log
+
+# Large model files - keep ignored unless you really want to push them
+models/*.pt
+models/*.onnx
+models/*.engine
+models/*.weights
+models/*.tflite
