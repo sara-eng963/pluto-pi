@@ -13,6 +13,7 @@ find_package(std_msgs REQUIRED)
 install(
   PROGRAMS
     scripts/comm_test.py
+    scripts/drive_client_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 # Install launch files
