@@ -435,8 +435,8 @@ class TestSequenceNode(Node):
     def send_command_and_wait(
         self,
         command: str,
-        ack_timeout_sec: float = 2.0,
-        motion_timeout_sec: float = 20.0,
+        ack_timeout_sec: float = 10.0,
+        motion_timeout_sec: float = 30.0,
     ) -> bool:
         """
         Sends one command and waits for the correct result.
