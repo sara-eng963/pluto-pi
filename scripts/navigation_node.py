@@ -165,6 +165,31 @@ class NavigationNode(Node):
         # If command is ROTATE, expect DONE ROTATE.
         self.expected_done_keyword = ""
 
+        # Latest full STATUS text from ESP1.
+        self.last_status_text = ""
+
+        # ---- Obstacle handling flags ----------------------------------------
+        self.obstacle_active = False
+        self.waiting_dynamic_clear = False
+        self.static_blocked = False
+        self.interrupt_requested = False
+
+        self.current_executing_command = ""
+        self.interrupted_command = ""
+
+        self.remaining_move_distance = 0.0
+        self.interrupted_move_heading = 0.0
+        self.has_remaining_move = False
+        # ---------------------------------------------------------------------
+
+        # Subscriber for obstacle events from mission_node.
+        self.obstacle_event_sub = self.create_subscription(
+            String,
+            "/obstacle_event",
+            self.obstacle_event_callback,
+            10,
+        )
+
         self.get_logger().info("Navigation node started.")
         self.log_current_pose()
 
@@ -195,6 +220,7 @@ class NavigationNode(Node):
 
         # STATUS is a valid immediate response, not a motion completion.
         if text.startswith("STATUS"):
+            self.last_status_text = text
             self.ack_received = True
             return
 
@@ -216,6 +242,41 @@ class NavigationNode(Node):
         if text.startswith("FAULT") or text.startswith("ERR"):
             self.fault_received = True
             return
+
+    def obstacle_event_callback(self, msg: String):
+        """
+        Receives obstacle events from mission_node on /obstacle_event.
+
+        OBSTACLE_DETECTED  – sends STOP immediately, sets interrupt flag
+        DYNAMIC_OBSTACLE_CLEARED – clears flags so execute loop can resume
+        STATIC_OBSTACLE    – sends STOP, marks static block
+        """
+
+        event = msg.data.strip()
+
+        if event.startswith("OBSTACLE_DETECTED"):
+            self.get_logger().warn(f"OBSTACLE EVENT: {event}")
+            self.obstacle_active = True
+            self.waiting_dynamic_clear = True
+            self.static_blocked = False
+            self.interrupt_requested = True
+            self.interrupted_command = self.current_executing_command
+            self.send_stop()
+
+        elif event.startswith("DYNAMIC_OBSTACLE_CLEARED"):
+            self.get_logger().info("OBSTACLE EVENT: DYNAMIC_OBSTACLE_CLEARED")
+            self.obstacle_active = False
+            self.waiting_dynamic_clear = False
+            self.static_blocked = False
+            # Resume is handled by the execute_navigation_to loop.
+
+        elif event.startswith("STATIC_OBSTACLE"):
+            self.get_logger().error(f"OBSTACLE EVENT: {event}")
+            self.obstacle_active = True
+            self.waiting_dynamic_clear = False
+            self.static_blocked = True
+            self.interrupt_requested = True
+            self.send_stop()
 
     # -------------------------------------------------------------------------
     # BASIC COMMAND FUNCTIONS
@@ -340,9 +401,14 @@ class NavigationNode(Node):
 
         return False
 
-    def wait_for_done(self, timeout_sec: float) -> bool:
+    def wait_for_done(self, timeout_sec: float) -> str:
         """
         Wait for ESP to finish a MOVE or ROTATE command.
+
+        Returns:
+            "DONE"        – motion completed successfully
+            "INTERRUPTED" – obstacle interrupt was requested
+            "FAILED"      – fault or timeout
         """
 
         start_time = time.time()
@@ -350,46 +416,48 @@ class NavigationNode(Node):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.05)
 
+            if self.interrupt_requested:
+                return "INTERRUPTED"
+
             if self.done_received:
-                return True
+                return "DONE"
 
             if self.fault_received:
                 self.get_logger().error(f"Motion failed: {self.last_status}")
-                return False
+                return "FAILED"
 
             if time.time() - start_time > timeout_sec:
                 self.get_logger().error("Timeout waiting for DONE.")
                 self.send_stop()
-                return False
+                return "FAILED"
 
-        return False
+        return "FAILED"
 
     def send_command_and_wait(
         self,
         command: str,
         ack_timeout_sec: float = 5.0,
         motion_timeout_sec: float = 30.0,
-    ) -> bool:
+    ) -> str:
         """
         Send one ESP command and wait for the correct response.
 
         Non-motion commands:
-            STATUS
-            STOP
-
-            Wait for any response.
+            STATUS, STOP – wait for any response.
 
         Motion commands:
-            ROTATE
-            MOVE
+            ROTATE, MOVE – wait for ACK, then wait for DONE.
 
-            Wait for ACK, then wait for DONE.
+        Returns:
+            "DONE"        – completed successfully
+            "INTERRUPTED" – obstacle interrupt during motion
+            "FAILED"      – no response, fault, or timeout
         """
 
         command = command.strip()
 
         if not command:
-            return True
+            return "DONE"
 
         self.reset_wait_flags()
         self.expected_done_keyword = self.expected_done_from_command(command)
@@ -402,25 +470,230 @@ class NavigationNode(Node):
 
             if not got_response:
                 self.get_logger().error(f"No ESP response for command: {command}")
-                return False
+                return "FAILED"
 
-            return True
+            return "DONE"
 
         # MOVE / ROTATE: first wait for ACK.
         got_ack = self.wait_for_ack(timeout_sec=ack_timeout_sec)
 
         if not got_ack:
             self.get_logger().error(f"No valid ACK for command: {command}")
-            return False
+            return "FAILED"
 
         # Then wait for DONE.
-        got_done = self.wait_for_done(timeout_sec=motion_timeout_sec)
+        result = self.wait_for_done(timeout_sec=motion_timeout_sec)
 
-        if not got_done:
+        if result == "DONE":
+            self.get_logger().info(f"Command completed: {command}")
+        elif result == "FAILED":
             self.get_logger().error(f"Command did not finish: {command}")
+
+        return result
+
+    # -------------------------------------------------------------------------
+    # OBSTACLE HANDLING
+    # -------------------------------------------------------------------------
+
+    def parse_move_status(self, status_text: str):
+        """
+        Parse ESP1 STATUS response to extract move progress.
+
+        ESP1 actual format:
+            STATUS mode=MOVE_FORWARD dist=0.45 target=1.00 ... yaw=0.0 ...
+
+        Returns:
+            (target_distance, moved_distance, heading) or None if parsing fails.
+        """
+
+        target = None
+        moved = None
+        heading = None
+
+        parts = status_text.split()
+        for part in parts:
+            if part.startswith("target="):
+                try:
+                    target = float(part[7:])
+                except ValueError:
+                    pass
+            elif part.startswith("dist="):
+                try:
+                    moved = float(part[5:])
+                except ValueError:
+                    pass
+            elif part.startswith("yaw="):
+                try:
+                    heading = float(part[4:])
+                except ValueError:
+                    pass
+
+        if target is None or moved is None or heading is None:
+            self.get_logger().error(
+                f"STATUS parse failed "
+                f"(target={target}, moved={moved}, heading={heading}): {status_text}"
+            )
+            return None
+
+        if moved < 0.0:
+            moved = 0.0
+        if moved > target:
+            moved = target
+
+        return target, moved, heading
+
+    def request_move_status_after_stop(self):
+        """
+        Send STATUS to ESP1 and parse the move-progress response.
+
+        Returns:
+            (target_distance, moved_distance, heading) or None if failed.
+        """
+
+        self.last_status_text = ""  # clear stale STATUS before requesting fresh one
+        result = self.send_command_and_wait("STATUS", ack_timeout_sec=5.0)
+
+        if result != "DONE":
+            self.get_logger().error("Failed to get STATUS from ESP1 after STOP.")
+            return None
+
+        parsed = self.parse_move_status(self.last_status_text)
+        if parsed is None:
+            self.get_logger().error("Cannot resume: STATUS parse failed.")
+            return None
+
+        return parsed
+
+    def prepare_remaining_move_after_interrupt(self, command: str):
+        """
+        After STOP, query STATUS and compute remaining move distance.
+
+        Sets:
+            self.has_remaining_move
+            self.remaining_move_distance
+            self.interrupted_move_heading
+        """
+
+        parts = command.strip().split()
+        if len(parts) < 2:
+            self.has_remaining_move = False
+            return
+
+        try:
+            commanded_distance = float(parts[1])
+        except ValueError:
+            self.has_remaining_move = False
+            return
+
+        parsed = self.request_move_status_after_stop()
+        if parsed is None:
+            self.get_logger().error(
+                "Cannot compute remaining distance: STATUS failed."
+            )
+            self.has_remaining_move = False
+            return
+
+        _target, moved_distance, _status_yaw = parsed
+
+        # Use the commanded heading from the original MOVE command (not the
+        # drifted IMU yaw) so the resume travels in the same direction.
+        try:
+            commanded_heading = float(parts[2]) if len(parts) >= 3 else _status_yaw
+        except ValueError:
+            commanded_heading = _status_yaw
+
+        remaining = commanded_distance - moved_distance
+        if remaining < 0.0:
+            remaining = 0.0
+
+        self.get_logger().info(
+            f"Interrupted MOVE: commanded={commanded_distance:.3f} "
+            f"moved={moved_distance:.3f} remaining={remaining:.3f}"
+        )
+
+        if remaining <= self.position_tolerance:
+            self.has_remaining_move = False
+            self.remaining_move_distance = 0.0
+            self.get_logger().info("Interrupted MOVE effectively complete.")
+            return
+
+        self.has_remaining_move = True
+        self.remaining_move_distance = remaining
+        self.interrupted_move_heading = commanded_heading
+
+    def wait_for_dynamic_clear_or_static(self) -> str:
+        """
+        Block until mission_node publishes DYNAMIC_OBSTACLE_CLEARED or STATIC_OBSTACLE.
+
+        Returns:
+            "CLEARED" – obstacle cleared dynamically
+            "STATIC"  – obstacle confirmed as static
+        """
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+            if self.static_blocked:
+                return "STATIC"
+
+            if not self.waiting_dynamic_clear and not self.obstacle_active:
+                return "CLEARED"
+
+        return "STATIC"
+
+    def handle_interrupted_command(self, command: str) -> bool:
+        """
+        Handle a command interrupted by an obstacle.
+
+        STOP has already been sent from obstacle_event_callback.
+
+        Returns:
+            True  – command completed or resumed successfully
+            False – blocked by static obstacle or resume failed
+        """
+
+        upper = command.strip().upper()
+
+        if upper.startswith("MOVE"):
+            self.prepare_remaining_move_after_interrupt(command)
+
+        result = self.wait_for_dynamic_clear_or_static()
+
+        if result == "STATIC":
+            self.get_logger().error("Static obstacle detected. Staying stopped.")
             return False
 
-        self.get_logger().info(f"Command completed: {command}")
+        # Dynamic clear received.
+        self.interrupt_requested = False
+        self.obstacle_active = False
+        self.waiting_dynamic_clear = False
+
+        if upper.startswith("MOVE"):
+            if not self.has_remaining_move:
+                self.get_logger().info(
+                    "Interrupted MOVE already effectively complete."
+                )
+                return True
+
+            resume_cmd = (
+                f"MOVE {self.remaining_move_distance:.2f} "
+                f"{self.interrupted_move_heading:.0f}"
+            )
+            self.get_logger().info(f"Resuming MOVE: {resume_cmd}")
+            resume_result = self.send_command_and_wait(resume_cmd)
+
+            if resume_result == "DONE":
+                self.has_remaining_move = False
+                self.remaining_move_distance = 0.0
+                return True
+            else:
+                return False
+
+        if upper.startswith("ROTATE"):
+            self.get_logger().info(f"Resuming ROTATE: {command}")
+            resume_result = self.send_command_and_wait(command)
+            return resume_result == "DONE"
+
         return True
 
     # -------------------------------------------------------------------------
@@ -531,9 +804,20 @@ class NavigationNode(Node):
         for index, command in enumerate(commands, start=1):
             self.get_logger().info(f"Navigation step {index}/{len(commands)}")
 
-            ok = self.send_command_and_wait(command)
+            self.current_executing_command = command
+            result = self.send_command_and_wait(command)
 
-            if not ok:
+            if result == "DONE":
+                pass  # continue to next command
+
+            elif result == "INTERRUPTED":
+                resumed = self.handle_interrupted_command(command)
+
+                if not resumed:
+                    self.get_logger().error("Navigation stopped due to obstacle.")
+                    return False
+
+            elif result == "FAILED":
                 self.get_logger().error("Navigation failed. Sending STOP.")
                 self.send_stop()
                 return False

@@ -12,7 +12,7 @@ class ObstacleDetectionTest(Node):
     def __init__(self):
         super().__init__("obstacle_detection_test")
 
-        self.STATIC_CONFIRM_TIME = 2.0  # seconds
+        self.STATIC_CONFIRM_TIME = 4.0  # seconds
 
         self.state = "CLEAR"
         self.latest_mask = 0
