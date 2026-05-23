@@ -180,6 +180,7 @@ class NavigationNode(Node):
         self.remaining_move_distance = 0.0
         self.interrupted_move_heading = 0.0
         self.has_remaining_move = False
+        self.remaining_move_valid = False
         # ---------------------------------------------------------------------
 
         # Subscriber for obstacle events from mission_node.
@@ -401,6 +402,33 @@ class NavigationNode(Node):
 
         return False
 
+    def wait_for_status_response(self, timeout_sec: float) -> bool:
+        """
+        Wait specifically for a STATUS response from ESP.
+
+        STOPPED, ACK, DONE, and other non-STATUS responses are ignored.
+        """
+
+        start_time = time.time()
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.05)
+
+            if self.last_status_text.startswith("STATUS"):
+                return True
+
+            if self.fault_received:
+                self.get_logger().error(
+                    f"ESP fault while waiting for STATUS: {self.last_status}"
+                )
+                return False
+
+            if time.time() - start_time > timeout_sec:
+                self.get_logger().error("Timeout waiting for STATUS response.")
+                return False
+
+        return False
+
     def wait_for_done(self, timeout_sec: float) -> str:
         """
         Wait for ESP to finish a MOVE or ROTATE command.
@@ -509,6 +537,7 @@ class NavigationNode(Node):
         target = None
         moved = None
         heading = None
+        yaw = None
 
         parts = status_text.split()
         for part in parts:
@@ -522,11 +551,19 @@ class NavigationNode(Node):
                     moved = float(part[5:])
                 except ValueError:
                     pass
-            elif part.startswith("yaw="):
+            elif part.startswith("heading="):
                 try:
-                    heading = float(part[4:])
+                    heading = float(part[8:])
                 except ValueError:
                     pass
+            elif part.startswith("yaw="):
+                try:
+                    yaw = float(part[4:])
+                except ValueError:
+                    pass
+
+        if heading is None:
+            heading = yaw
 
         if target is None or moved is None or heading is None:
             self.get_logger().error(
@@ -550,10 +587,11 @@ class NavigationNode(Node):
             (target_distance, moved_distance, heading) or None if failed.
         """
 
-        self.last_status_text = ""  # clear stale STATUS before requesting fresh one
-        result = self.send_command_and_wait("STATUS", ack_timeout_sec=5.0)
+        self.reset_wait_flags()
+        self.last_status_text = ""
+        self.publish_command("STATUS")
 
-        if result != "DONE":
+        if not self.wait_for_status_response(timeout_sec=5.0):
             self.get_logger().error("Failed to get STATUS from ESP1 after STOP.")
             return None
 
@@ -574,52 +612,54 @@ class NavigationNode(Node):
             self.interrupted_move_heading
         """
 
+        self.remaining_move_valid = False
+        self.has_remaining_move = False
+        self.remaining_move_distance = 0.0
+
         parts = command.strip().split()
         if len(parts) < 2:
-            self.has_remaining_move = False
-            return
+            return False
 
         try:
             commanded_distance = float(parts[1])
         except ValueError:
-            self.has_remaining_move = False
-            return
+            return False
 
         parsed = self.request_move_status_after_stop()
         if parsed is None:
             self.get_logger().error(
                 "Cannot compute remaining distance: STATUS failed."
             )
-            self.has_remaining_move = False
-            return
+            return False
 
-        _target, moved_distance, _status_yaw = parsed
+        target_distance, moved_distance, status_heading = parsed
+        self.remaining_move_valid = True
 
         # Use the commanded heading from the original MOVE command (not the
         # drifted IMU yaw) so the resume travels in the same direction.
         try:
-            commanded_heading = float(parts[2]) if len(parts) >= 3 else _status_yaw
+            commanded_heading = float(parts[2]) if len(parts) >= 3 else status_heading
         except ValueError:
-            commanded_heading = _status_yaw
+            commanded_heading = status_heading
 
-        remaining = commanded_distance - moved_distance
+        remaining = target_distance - moved_distance
         if remaining < 0.0:
             remaining = 0.0
 
         self.get_logger().info(
-            f"Interrupted MOVE: commanded={commanded_distance:.3f} "
+            f"Interrupted MOVE: commanded={target_distance:.3f} "
             f"moved={moved_distance:.3f} remaining={remaining:.3f}"
         )
 
         if remaining <= self.position_tolerance:
             self.has_remaining_move = False
             self.remaining_move_distance = 0.0
-            self.get_logger().info("Interrupted MOVE effectively complete.")
-            return
+            return True
 
         self.has_remaining_move = True
         self.remaining_move_distance = remaining
         self.interrupted_move_heading = commanded_heading
+        return True
 
     def wait_for_dynamic_clear_or_static(self) -> str:
         """
@@ -655,7 +695,12 @@ class NavigationNode(Node):
         upper = command.strip().upper()
 
         if upper.startswith("MOVE"):
-            self.prepare_remaining_move_after_interrupt(command)
+            success = self.prepare_remaining_move_after_interrupt(command)
+            if not success:
+                self.get_logger().error(
+                    "Cannot resume MOVE because remaining distance is unknown."
+                )
+                return False
 
         result = self.wait_for_dynamic_clear_or_static()
 
@@ -669,10 +714,11 @@ class NavigationNode(Node):
         self.waiting_dynamic_clear = False
 
         if upper.startswith("MOVE"):
+            if not self.remaining_move_valid:
+                return False
+
             if not self.has_remaining_move:
-                self.get_logger().info(
-                    "Interrupted MOVE already effectively complete."
-                )
+                self.get_logger().info("Interrupted MOVE effectively complete.")
                 return True
 
             resume_cmd = (
