@@ -194,6 +194,7 @@ class NavigationNode(Node):
         self.interrupted_move_heading = 0.0
         self.interrupted_move_moved_distance = 0.0
         self.interrupted_move_target_distance = 0.0
+        self.latest_static_obstacle_mask = 0
         self.has_remaining_move = False
         self.remaining_move_valid = False
 
@@ -314,6 +315,16 @@ class NavigationNode(Node):
             # Resume is handled by the execute_navigation_to loop.
 
         elif event.startswith("STATIC_OBSTACLE"):
+            parsed_mask = 0
+            for part in event.split():
+                if part.startswith("mask="):
+                    try:
+                        parsed_mask = int(part[5:])
+                    except ValueError:
+                        parsed_mask = 0
+                    break
+
+            self.latest_static_obstacle_mask = parsed_mask
             self.get_logger().error(f"OBSTACLE EVENT: {event}")
             self.obstacle_active = True
             self.waiting_dynamic_clear = False
@@ -849,8 +860,14 @@ class NavigationNode(Node):
             )
             self.apply_move_to_logical_pose(moved_distance, interrupted_heading)
 
-            avoid_heading = self.left_of_heading(interrupted_heading)
-            self.get_logger().info(f"Static avoidance heading: {avoid_heading:.0f}")
+            avoid_heading, avoid_side = self.choose_static_avoidance_heading(
+                interrupted_heading,
+                self.latest_static_obstacle_mask,
+            )
+            self.get_logger().info(
+                f"Static obstacle mask={self.latest_static_obstacle_mask}, "
+                f"avoiding {avoid_side}, heading={avoid_heading:.0f}"
+            )
 
             # Clear original interruption state before running explicit sidestep
             # commands; otherwise wait_for_done may immediately return INTERRUPTED.
@@ -993,6 +1010,34 @@ class NavigationNode(Node):
         """
 
         return self.normalize_yaw_deg(heading_deg + 90.0)
+
+    def right_of_heading(self, heading_deg: float) -> float:
+        """
+        Return heading to the right (-90 deg), normalized to [-180, 180].
+        """
+
+        return self.normalize_yaw_deg(heading_deg - 90.0)
+
+    def choose_static_avoidance_heading(self, original_heading: float, mask: int):
+        """
+        Choose sidestep direction from static obstacle mask.
+
+        Decision rule:
+            left blocked, right clear  -> avoid right
+            right blocked, left clear  -> avoid left
+            otherwise                  -> avoid left (default)
+        """
+
+        left_blocked = (mask & 1) != 0
+        right_blocked = (mask & 4) != 0
+
+        if left_blocked and not right_blocked:
+            return self.right_of_heading(original_heading), "right"
+
+        if right_blocked and not left_blocked:
+            return self.left_of_heading(original_heading), "left"
+
+        return self.left_of_heading(original_heading), "left"
 
     def same_pose(self, a: Pose2D, b: Pose2D) -> bool:
         """
