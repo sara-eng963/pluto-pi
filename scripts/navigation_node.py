@@ -207,6 +207,7 @@ class NavigationNode(Node):
 
         self.active_target_pose = None
         self.static_avoidance_count = 0
+        self.next_axis_order = "XY"
         # ---------------------------------------------------------------------
 
         # Subscriber for obstacle events from mission_node.
@@ -916,6 +917,12 @@ class NavigationNode(Node):
             moved_distance = self.interrupted_move_moved_distance
             target_distance = self.interrupted_move_target_distance
 
+            interrupted_axis = self.heading_axis(interrupted_heading)
+            if interrupted_axis == "Y":
+                self.next_axis_order = "YX"
+            else:
+                self.next_axis_order = "XY"
+
             self.get_logger().info(
                 f"STATUS: dist={moved_distance:.2f} "
                 f"target={target_distance:.2f} heading={interrupted_heading:.0f}"
@@ -1121,6 +1128,21 @@ class NavigationNode(Node):
 
         return self.left_of_heading(original_heading), "left"
 
+    def heading_axis(self, heading_deg: float):
+        """
+        Return axis label for Manhattan headings: "X", "Y", or None.
+        """
+
+        heading = self.normalize_yaw_deg(heading_deg)
+
+        if abs(heading - 0.0) < 1e-3 or abs(abs(heading) - 180.0) < 1e-3:
+            return "X"
+
+        if abs(heading - 90.0) < 1e-3 or abs(heading + 90.0) < 1e-3:
+            return "Y"
+
+        return None
+
     def same_pose(self, a: Pose2D, b: Pose2D) -> bool:
         """
         Compare poses with small tolerance for target tracking.
@@ -1132,13 +1154,13 @@ class NavigationNode(Node):
             and abs(self.normalize_yaw_deg(a.yaw) - self.normalize_yaw_deg(b.yaw)) < 1e-6
         )
 
-    def manhattan_commands(self, target_pose: Pose2D) -> List[str]:
+    def manhattan_commands(self, target_pose: Pose2D, axis_order: str = "XY") -> List[str]:
         """
         Convert target pose into Manhattan-style ROTATE/MOVE commands.
 
         Movement order:
-            1. X movement
-            2. Y movement
+            XY: X movement then Y movement
+            YX: Y movement then X movement
             3. Final yaw
 
         Coordinate convention:
@@ -1167,25 +1189,26 @@ class NavigationNode(Node):
 
         self.get_logger().info(f"dx={dx:.2f}, dy={dy:.2f}")
 
-        # ---------------------------------------------------------------------
-        # X movement first
-        # ---------------------------------------------------------------------
-        if abs(dx) > self.position_tolerance:
-            heading = 0.0 if dx > 0.0 else 180.0
-            distance = abs(dx)
+        def append_x_segment():
+            if abs(dx) > self.position_tolerance:
+                heading = 0.0 if dx > 0.0 else 180.0
+                distance = abs(dx)
+                commands.append(f"ROTATE {heading:.0f}")
+                commands.append(f"MOVE {distance:.2f} {heading:.0f}")
 
-            commands.append(f"ROTATE {heading:.0f}")
-            commands.append(f"MOVE {distance:.2f} {heading:.0f}")
+        def append_y_segment():
+            if abs(dy) > self.position_tolerance:
+                heading = 90.0 if dy > 0.0 else -90.0
+                distance = abs(dy)
+                commands.append(f"ROTATE {heading:.0f}")
+                commands.append(f"MOVE {distance:.2f} {heading:.0f}")
 
-        # ---------------------------------------------------------------------
-        # Y movement second
-        # ---------------------------------------------------------------------
-        if abs(dy) > self.position_tolerance:
-            heading = 90.0 if dy > 0.0 else -90.0
-            distance = abs(dy)
-
-            commands.append(f"ROTATE {heading:.0f}")
-            commands.append(f"MOVE {distance:.2f} {heading:.0f}")
+        if axis_order == "YX":
+            append_y_segment()
+            append_x_segment()
+        else:
+            append_x_segment()
+            append_y_segment()
 
         # ---------------------------------------------------------------------
         # Final orientation
@@ -1224,6 +1247,7 @@ class NavigationNode(Node):
                 yaw=normalized_target.yaw,
             )
             self.static_avoidance_count = 0
+            self.next_axis_order = "XY"
 
         # Start each navigation request from an idle obstacle state, then drain
         # stale queued callbacks while idle so old obstacle events are ignored.
@@ -1240,7 +1264,10 @@ class NavigationNode(Node):
 
         self.navigation_active = True
 
-        commands = self.manhattan_commands(normalized_target)
+        commands = self.manhattan_commands(
+            normalized_target,
+            axis_order=self.next_axis_order,
+        )
 
         self.get_logger().info("Generated command sequence:")
 
@@ -1283,6 +1310,7 @@ class NavigationNode(Node):
                         self.navigation_active = False
                         self.active_target_pose = None
                         self.static_avoidance_count = 0
+                        self.next_axis_order = "XY"
                         return False
 
                     self.get_logger().info(
@@ -1296,6 +1324,7 @@ class NavigationNode(Node):
                     self.navigation_active = False
                     self.active_target_pose = None
                     self.static_avoidance_count = 0
+                    self.next_axis_order = "XY"
                     return False
 
             elif result == "FAILED":
@@ -1305,6 +1334,7 @@ class NavigationNode(Node):
                 self.navigation_active = False
                 self.active_target_pose = None
                 self.static_avoidance_count = 0
+                self.next_axis_order = "XY"
                 return False
 
             # Short controlled pause between commands.
@@ -1328,6 +1358,7 @@ class NavigationNode(Node):
         self.navigation_active = False
         self.active_target_pose = None
         self.static_avoidance_count = 0
+        self.next_axis_order = "XY"
 
         return True
 
