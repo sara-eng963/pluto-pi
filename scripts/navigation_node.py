@@ -181,6 +181,11 @@ class NavigationNode(Node):
         self.interrupted_move_heading = 0.0
         self.has_remaining_move = False
         self.remaining_move_valid = False
+
+        # Navigation execution state.
+        # Used to ignore stale obstacle events received while idle.
+        self.navigation_active = False
+        self.command_active = False
         # ---------------------------------------------------------------------
 
         # Subscriber for obstacle events from mission_node.
@@ -254,6 +259,18 @@ class NavigationNode(Node):
         """
 
         event = msg.data.strip()
+
+        if not self.navigation_active:
+            self.get_logger().info(
+                f"Ignoring obstacle event while navigation idle: {event}"
+            )
+            return
+
+        if not self.command_active:
+            self.get_logger().info(
+                f"Ignoring obstacle event because no command is active: {event}"
+            )
+            return
 
         if event.startswith("OBSTACLE_DETECTED"):
             self.get_logger().warn(f"OBSTACLE EVENT: {event}")
@@ -579,6 +596,63 @@ class NavigationNode(Node):
 
         return target, moved, heading
 
+    def parse_status_active_flag(self, status_text: str):
+        """
+        Parse STATUS text and return drive active flag.
+
+        Returns:
+            True  -> active=1
+            False -> active=0
+            None  -> active field missing or invalid
+        """
+
+        for part in status_text.split():
+            if part.startswith("active="):
+                try:
+                    return int(part[7:]) != 0
+                except ValueError:
+                    return None
+
+        return None
+
+    def wait_until_drive_idle(self, timeout_sec: float = 2.0) -> bool:
+        """
+        Poll ESP1 STATUS until active=0.
+
+        Used after obstacle STOP so resume commands are sent only when ESP1
+        is no longer busy.
+        """
+
+        start_time = time.time()
+
+        while rclpy.ok():
+            self.reset_wait_flags()
+            self.last_status_text = ""
+            self.publish_command("STATUS")
+
+            if self.wait_for_status_response(timeout_sec=0.5):
+                is_active = self.parse_status_active_flag(self.last_status_text)
+
+                if is_active is False:
+                    return True
+
+                if is_active is True:
+                    time.sleep(0.05)
+                else:
+                    self.get_logger().warn(
+                        f"STATUS missing active flag: {self.last_status_text}"
+                    )
+                    time.sleep(0.05)
+            else:
+                # Keep retrying within timeout window.
+                time.sleep(0.05)
+
+            if time.time() - start_time > timeout_sec:
+                self.get_logger().error("Timeout waiting for ESP1 drive idle.")
+                return False
+
+        return False
+
     def request_move_status_after_stop(self):
         """
         Send STATUS to ESP1 and parse the move-progress response.
@@ -713,6 +787,10 @@ class NavigationNode(Node):
         self.obstacle_active = False
         self.waiting_dynamic_clear = False
 
+        if not self.wait_until_drive_idle():
+            self.get_logger().error("Cannot resume: ESP1 still busy after STOP.")
+            return False
+
         if upper.startswith("MOVE"):
             if not self.remaining_move_valid:
                 return False
@@ -726,7 +804,10 @@ class NavigationNode(Node):
                 f"{self.interrupted_move_heading:.0f}"
             )
             self.get_logger().info(f"Resuming MOVE: {resume_cmd}")
+            self.current_executing_command = resume_cmd
+            self.command_active = True
             resume_result = self.send_command_and_wait(resume_cmd)
+            self.command_active = False
 
             if resume_result == "DONE":
                 self.has_remaining_move = False
@@ -737,7 +818,10 @@ class NavigationNode(Node):
 
         if upper.startswith("ROTATE"):
             self.get_logger().info(f"Resuming ROTATE: {command}")
+            self.current_executing_command = command
+            self.command_active = True
             resume_result = self.send_command_and_wait(command)
+            self.command_active = False
             return resume_result == "DONE"
 
         return True
@@ -840,6 +924,21 @@ class NavigationNode(Node):
             keep old current_pose
         """
 
+        # Start each navigation request from an idle obstacle state, then drain
+        # stale queued callbacks while idle so old obstacle events are ignored.
+        self.navigation_active = False
+        self.command_active = False
+        self.obstacle_active = False
+        self.waiting_dynamic_clear = False
+        self.static_blocked = False
+        self.interrupt_requested = False
+
+        flush_start = time.time()
+        while time.time() - flush_start < 0.2 and rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.01)
+
+        self.navigation_active = True
+
         commands = self.manhattan_commands(target_pose)
 
         self.get_logger().info("Generated command sequence:")
@@ -851,21 +950,33 @@ class NavigationNode(Node):
             self.get_logger().info(f"Navigation step {index}/{len(commands)}")
 
             self.current_executing_command = command
+
+            if self.is_motion_command(command):
+                self.command_active = True
+
             result = self.send_command_and_wait(command)
 
             if result == "DONE":
+                if self.is_motion_command(command):
+                    self.command_active = False
                 pass  # continue to next command
 
             elif result == "INTERRUPTED":
                 resumed = self.handle_interrupted_command(command)
 
+                if self.is_motion_command(command):
+                    self.command_active = False
+
                 if not resumed:
                     self.get_logger().error("Navigation stopped due to obstacle.")
+                    self.navigation_active = False
                     return False
 
             elif result == "FAILED":
                 self.get_logger().error("Navigation failed. Sending STOP.")
                 self.send_stop()
+                self.command_active = False
+                self.navigation_active = False
                 return False
 
             # Short controlled pause between commands.
@@ -884,6 +995,9 @@ class NavigationNode(Node):
 
         self.get_logger().info("Navigation succeeded.")
         self.log_current_pose()
+
+        self.command_active = False
+        self.navigation_active = False
 
         return True
 
