@@ -66,7 +66,15 @@ from typing import List, Union
 
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import Bool
 from std_msgs.msg import String
+
+
+STATIC_AVOIDANCE_DISTANCE = 0.50
+MAX_STATIC_AVOIDANCE_ATTEMPTS = 3
+INTERRUPT_RESUMED = "INTERRUPT_RESUMED"
+STATIC_AVOIDANCE_DONE = "STATIC_AVOIDANCE_DONE"
+INTERRUPT_FAILED = "INTERRUPT_FAILED"
 
 
 # =============================================================================
@@ -125,6 +133,11 @@ class NavigationNode(Node):
         #   STOP
         #   STATUS
         self.cmd_pub = self.create_publisher(String, "/drive_cmd", 10)
+        self.mission_reset_pub = self.create_publisher(
+            Bool,
+            "/mission_reset_obstacle",
+            10,
+        )
 
         # ---------------------------------------------------------------------
         # ROS subscriber from ESP
@@ -179,6 +192,8 @@ class NavigationNode(Node):
 
         self.remaining_move_distance = 0.0
         self.interrupted_move_heading = 0.0
+        self.interrupted_move_moved_distance = 0.0
+        self.interrupted_move_target_distance = 0.0
         self.has_remaining_move = False
         self.remaining_move_valid = False
 
@@ -186,6 +201,9 @@ class NavigationNode(Node):
         # Used to ignore stale obstacle events received while idle.
         self.navigation_active = False
         self.command_active = False
+
+        self.active_target_pose = None
+        self.static_avoidance_count = 0
         # ---------------------------------------------------------------------
 
         # Subscriber for obstacle events from mission_node.
@@ -336,6 +354,16 @@ class NavigationNode(Node):
 
         self.get_logger().warn("Sending STOP.")
         self.publish_command("STOP")
+
+    def reset_mission_obstacle_state(self):
+        """
+        Notify mission_node to clear STATIC_LOCKED after sidestep completion.
+        """
+
+        msg = Bool()
+        msg.data = True
+        self.mission_reset_pub.publish(msg)
+        self.get_logger().info("Published /mission_reset_obstacle = true")
 
     def is_motion_command(self, command: str) -> bool:
         """
@@ -708,6 +736,8 @@ class NavigationNode(Node):
 
         target_distance, moved_distance, status_heading = parsed
         self.remaining_move_valid = True
+        self.interrupted_move_moved_distance = moved_distance
+        self.interrupted_move_target_distance = target_distance
 
         # Use the commanded heading from the original MOVE command (not the
         # drifted IMU yaw) so the resume travels in the same direction.
@@ -755,15 +785,16 @@ class NavigationNode(Node):
 
         return "STATIC"
 
-    def handle_interrupted_command(self, command: str) -> bool:
+    def handle_interrupted_command(self, command: str) -> str:
         """
         Handle a command interrupted by an obstacle.
 
         STOP has already been sent from obstacle_event_callback.
 
         Returns:
-            True  – command completed or resumed successfully
-            False – blocked by static obstacle or resume failed
+            INTERRUPT_RESUMED       – interrupted command successfully completed
+            STATIC_AVOIDANCE_DONE   – static sidestep completed, caller should replan
+            INTERRUPT_FAILED        – failed to recover
         """
 
         upper = command.strip().upper()
@@ -774,13 +805,79 @@ class NavigationNode(Node):
                 self.get_logger().error(
                     "Cannot resume MOVE because remaining distance is unknown."
                 )
-                return False
+                return INTERRUPT_FAILED
 
         result = self.wait_for_dynamic_clear_or_static()
 
         if result == "STATIC":
-            self.get_logger().error("Static obstacle detected. Staying stopped.")
-            return False
+            if not upper.startswith("MOVE"):
+                self.get_logger().error(
+                    "Static obstacle detected during non-MOVE command. Staying stopped."
+                )
+                return INTERRUPT_FAILED
+
+            self.get_logger().warn("Static obstacle detected during MOVE.")
+
+            if not self.remaining_move_valid:
+                self.get_logger().error(
+                    "Cannot perform static avoidance: missing interrupted MOVE STATUS."
+                )
+                return INTERRUPT_FAILED
+
+            if not self.wait_until_drive_idle():
+                self.get_logger().error("Cannot avoid: ESP1 still busy after STOP.")
+                return INTERRUPT_FAILED
+
+            interrupted_heading = self.normalize_yaw_deg(self.interrupted_move_heading)
+            moved_distance = self.interrupted_move_moved_distance
+            target_distance = self.interrupted_move_target_distance
+
+            self.get_logger().info(
+                f"STATUS: dist={moved_distance:.2f} "
+                f"target={target_distance:.2f} heading={interrupted_heading:.0f}"
+            )
+            self.get_logger().info(
+                f"Updating pose by interrupted moved distance: "
+                f"{moved_distance:.2f} heading {interrupted_heading:.0f}"
+            )
+            self.apply_move_to_logical_pose(moved_distance, interrupted_heading)
+
+            avoid_heading = self.left_of_heading(interrupted_heading)
+            self.get_logger().info(f"Static avoidance heading: {avoid_heading:.0f}")
+
+            avoidance_commands = [
+                f"ROTATE {avoid_heading:.0f}",
+                f"MOVE {STATIC_AVOIDANCE_DISTANCE:.2f} {avoid_heading:.0f}",
+                f"ROTATE {interrupted_heading:.0f}",
+            ]
+
+            for avoid_cmd in avoidance_commands:
+                self.current_executing_command = avoid_cmd
+                avoid_result = self.send_command_and_wait(avoid_cmd)
+                if avoid_result != "DONE":
+                    self.get_logger().error(
+                        f"Static avoidance command failed: {avoid_cmd}"
+                    )
+                    self.send_stop()
+                    return INTERRUPT_FAILED
+
+            self.get_logger().info(
+                f"Updating pose by sidestep: "
+                f"{STATIC_AVOIDANCE_DISTANCE:.2f} heading {avoid_heading:.0f}"
+            )
+            self.apply_move_to_logical_pose(STATIC_AVOIDANCE_DISTANCE, avoid_heading)
+            self.current_pose.yaw = interrupted_heading
+
+            self.interrupt_requested = False
+            self.obstacle_active = False
+            self.waiting_dynamic_clear = False
+            self.static_blocked = False
+            self.remaining_move_valid = False
+            self.has_remaining_move = False
+            self.remaining_move_distance = 0.0
+
+            self.reset_mission_obstacle_state()
+            return STATIC_AVOIDANCE_DONE
 
         # Dynamic clear received.
         self.interrupt_requested = False
@@ -789,15 +886,15 @@ class NavigationNode(Node):
 
         if not self.wait_until_drive_idle():
             self.get_logger().error("Cannot resume: ESP1 still busy after STOP.")
-            return False
+            return INTERRUPT_FAILED
 
         if upper.startswith("MOVE"):
             if not self.remaining_move_valid:
-                return False
+                return INTERRUPT_FAILED
 
             if not self.has_remaining_move:
                 self.get_logger().info("Interrupted MOVE effectively complete.")
-                return True
+                return INTERRUPT_RESUMED
 
             resume_cmd = (
                 f"MOVE {self.remaining_move_distance:.2f} "
@@ -812,9 +909,9 @@ class NavigationNode(Node):
             if resume_result == "DONE":
                 self.has_remaining_move = False
                 self.remaining_move_distance = 0.0
-                return True
+                return INTERRUPT_RESUMED
             else:
-                return False
+                return INTERRUPT_FAILED
 
         if upper.startswith("ROTATE"):
             self.get_logger().info(f"Resuming ROTATE: {command}")
@@ -822,9 +919,9 @@ class NavigationNode(Node):
             self.command_active = True
             resume_result = self.send_command_and_wait(command)
             self.command_active = False
-            return resume_result == "DONE"
+            return INTERRUPT_RESUMED if resume_result == "DONE" else INTERRUPT_FAILED
 
-        return True
+        return INTERRUPT_RESUMED
 
     # -------------------------------------------------------------------------
     # NAVIGATION LOGIC
@@ -848,6 +945,48 @@ class NavigationNode(Node):
             yaw += 360.0
 
         return yaw
+
+    def apply_move_to_logical_pose(self, distance: float, heading_deg: float):
+        """
+        Update logical (x, y) by moving distance along Manhattan heading.
+        """
+
+        heading = self.normalize_yaw_deg(heading_deg)
+
+        if abs(heading - 0.0) < 1e-3:
+            self.current_pose.x += distance
+        elif abs(abs(heading) - 180.0) < 1e-3:
+            self.current_pose.x -= distance
+        elif abs(heading - 90.0) < 1e-3:
+            self.current_pose.y += distance
+        elif abs(heading + 90.0) < 1e-3:
+            self.current_pose.y -= distance
+        else:
+            self.get_logger().warn(
+                f"Non-Manhattan heading for pose update: {heading:.2f}. "
+                "Ignoring pose translation update."
+            )
+            return
+
+        self.log_current_pose()
+
+    def left_of_heading(self, heading_deg: float) -> float:
+        """
+        Return heading to the left (+90 deg), normalized to [-180, 180].
+        """
+
+        return self.normalize_yaw_deg(heading_deg + 90.0)
+
+    def same_pose(self, a: Pose2D, b: Pose2D) -> bool:
+        """
+        Compare poses with small tolerance for target tracking.
+        """
+
+        return (
+            abs(a.x - b.x) < 1e-6
+            and abs(a.y - b.y) < 1e-6
+            and abs(self.normalize_yaw_deg(a.yaw) - self.normalize_yaw_deg(b.yaw)) < 1e-6
+        )
 
     def manhattan_commands(self, target_pose: Pose2D) -> List[str]:
         """
@@ -924,6 +1063,23 @@ class NavigationNode(Node):
             keep old current_pose
         """
 
+        normalized_target = Pose2D(
+            x=target_pose.x,
+            y=target_pose.y,
+            yaw=self.normalize_yaw_deg(target_pose.yaw),
+        )
+
+        if self.active_target_pose is None or not self.same_pose(
+            self.active_target_pose,
+            normalized_target,
+        ):
+            self.active_target_pose = Pose2D(
+                x=normalized_target.x,
+                y=normalized_target.y,
+                yaw=normalized_target.yaw,
+            )
+            self.static_avoidance_count = 0
+
         # Start each navigation request from an idle obstacle state, then drain
         # stale queued callbacks while idle so old obstacle events are ignored.
         self.navigation_active = False
@@ -939,7 +1095,7 @@ class NavigationNode(Node):
 
         self.navigation_active = True
 
-        commands = self.manhattan_commands(target_pose)
+        commands = self.manhattan_commands(normalized_target)
 
         self.get_logger().info("Generated command sequence:")
 
@@ -962,14 +1118,38 @@ class NavigationNode(Node):
                 pass  # continue to next command
 
             elif result == "INTERRUPTED":
-                resumed = self.handle_interrupted_command(command)
+                interrupt_result = self.handle_interrupted_command(command)
 
                 if self.is_motion_command(command):
                     self.command_active = False
 
-                if not resumed:
+                if interrupt_result == INTERRUPT_RESUMED:
+                    pass
+                elif interrupt_result == STATIC_AVOIDANCE_DONE:
+                    self.static_avoidance_count += 1
+
+                    if self.static_avoidance_count > MAX_STATIC_AVOIDANCE_ATTEMPTS:
+                        self.get_logger().error(
+                            "Exceeded max static avoidance attempts. Sending STOP."
+                        )
+                        self.send_stop()
+                        self.command_active = False
+                        self.navigation_active = False
+                        self.active_target_pose = None
+                        self.static_avoidance_count = 0
+                        return False
+
+                    self.get_logger().info(
+                        "Replanning to original target from updated pose."
+                    )
+                    self.navigation_active = False
+                    self.command_active = False
+                    return self.execute_navigation_to(self.active_target_pose)
+                else:
                     self.get_logger().error("Navigation stopped due to obstacle.")
                     self.navigation_active = False
+                    self.active_target_pose = None
+                    self.static_avoidance_count = 0
                     return False
 
             elif result == "FAILED":
@@ -977,6 +1157,8 @@ class NavigationNode(Node):
                 self.send_stop()
                 self.command_active = False
                 self.navigation_active = False
+                self.active_target_pose = None
+                self.static_avoidance_count = 0
                 return False
 
             # Short controlled pause between commands.
@@ -988,9 +1170,9 @@ class NavigationNode(Node):
 
         # Update logical pose only after full success.
         self.current_pose = Pose2D(
-            x=target_pose.x,
-            y=target_pose.y,
-            yaw=self.normalize_yaw_deg(target_pose.yaw),
+            x=normalized_target.x,
+            y=normalized_target.y,
+            yaw=normalized_target.yaw,
         )
 
         self.get_logger().info("Navigation succeeded.")
@@ -998,6 +1180,8 @@ class NavigationNode(Node):
 
         self.command_active = False
         self.navigation_active = False
+        self.active_target_pose = None
+        self.static_avoidance_count = 0
 
         return True
 
