@@ -21,7 +21,8 @@ Architecture:
         - Converts target pose into ROTATE/MOVE commands
         - Sends commands one by one to ESP through /drive_cmd
         - Waits for ACK and DONE from /drive_status
-        - Updates current pose only after full successful navigation
+        - Updates current pose incrementally as commands complete
+        - Applies a final snap correction to the requested target on success
 
     ESP32:
         - Receives low-level movement commands:
@@ -158,7 +159,7 @@ class NavigationNode(Node):
 
         # Logical robot pose stored by the Pi.
         #
-        # This is updated only after a full navigation sequence succeeds.
+        # This is updated incrementally as commands complete.
         self.current_pose = current_pose
 
         # If dx or dy is smaller than this, skip that movement.
@@ -298,6 +299,26 @@ class NavigationNode(Node):
             )
             return
 
+        if event.startswith("DYNAMIC_OBSTACLE_CLEARED"):
+            if not self.obstacle_active:
+                self.get_logger().info(
+                    "Ignoring DYNAMIC_OBSTACLE_CLEARED because no MOVE obstacle is active."
+                )
+                return
+
+            self.get_logger().info("OBSTACLE EVENT: DYNAMIC_OBSTACLE_CLEARED")
+            self.obstacle_active = False
+            self.waiting_dynamic_clear = False
+            self.static_blocked = False
+            # Resume is handled by the execute_navigation_to loop.
+            return
+
+        if not self.current_command_is_move():
+            self.get_logger().info(
+                f"Ignoring obstacle event during non-MOVE command: {event}"
+            )
+            return
+
         if event.startswith("OBSTACLE_DETECTED"):
             self.get_logger().warn(f"OBSTACLE EVENT: {event}")
             self.obstacle_active = True
@@ -306,13 +327,6 @@ class NavigationNode(Node):
             self.interrupt_requested = True
             self.interrupted_command = self.current_executing_command
             self.send_stop()
-
-        elif event.startswith("DYNAMIC_OBSTACLE_CLEARED"):
-            self.get_logger().info("OBSTACLE EVENT: DYNAMIC_OBSTACLE_CLEARED")
-            self.obstacle_active = False
-            self.waiting_dynamic_clear = False
-            self.static_blocked = False
-            # Resume is handled by the execute_navigation_to loop.
 
         elif event.startswith("STATIC_OBSTACLE"):
             parsed_mask = 0
@@ -364,6 +378,58 @@ class NavigationNode(Node):
 
         self.cmd_pub.publish(msg)
         self.get_logger().info(f"SEND: {command}")
+
+    def update_pose_after_successful_command(self, command: str, context: str):
+        """
+        Incrementally update logical pose after a successfully completed command.
+
+        context is a short label for logging, e.g. "normal", "dynamic-resume".
+        """
+
+        parts = command.strip().split()
+        if not parts:
+            return
+
+        kind = parts[0].upper()
+
+        if kind == "MOVE" and len(parts) >= 3:
+            try:
+                distance = float(parts[1])
+                heading = float(parts[2])
+            except ValueError:
+                self.get_logger().warn(f"Cannot parse MOVE for pose update: {command}")
+                return
+
+            self.apply_move_to_logical_pose(distance, heading)
+            self.get_logger().info(
+                f"Pose updated after {context} MOVE: "
+                f"distance={distance:.2f}, heading={self.normalize_yaw_deg(heading):.0f}"
+            )
+            return
+
+        if kind == "ROTATE" and len(parts) >= 2:
+            try:
+                heading = float(parts[1])
+            except ValueError:
+                self.get_logger().warn(
+                    f"Cannot parse ROTATE for yaw update: {command}"
+                )
+                return
+
+            self.current_pose.yaw = self.normalize_yaw_deg(heading)
+            self.get_logger().info(
+                f"Pose updated after {context} ROTATE: "
+                f"yaw={self.current_pose.yaw:.0f}"
+            )
+            self.log_current_pose()
+            return
+
+    def current_command_is_move(self) -> bool:
+        """
+        True when the current executing command is MOVE.
+        """
+
+        return self.current_executing_command.strip().upper().startswith("MOVE")
 
     def send_stop(self):
         """
@@ -859,6 +925,7 @@ class NavigationNode(Node):
                 f"{moved_distance:.2f} heading {interrupted_heading:.0f}"
             )
             self.apply_move_to_logical_pose(moved_distance, interrupted_heading)
+            self.get_logger().info("Pose updated after static moved-distance update.")
 
             avoid_heading, avoid_side = self.choose_static_avoidance_heading(
                 interrupted_heading,
@@ -899,6 +966,7 @@ class NavigationNode(Node):
                 f"{STATIC_AVOIDANCE_DISTANCE:.2f} heading {avoid_heading:.0f}"
             )
             self.apply_move_to_logical_pose(STATIC_AVOIDANCE_DISTANCE, avoid_heading)
+            self.get_logger().info("Pose updated after static sidestep update.")
             self.current_pose.yaw = interrupted_heading
             self.static_avoidance_active = False
 
@@ -928,6 +996,14 @@ class NavigationNode(Node):
 
             if not self.has_remaining_move:
                 self.get_logger().info("Interrupted MOVE effectively complete.")
+                # No resume command is needed; reflect completed original MOVE.
+                self.update_pose_after_successful_command(
+                    command,
+                    context="dynamic-resume",
+                )
+                self.get_logger().info(
+                    "Pose updated after dynamic resume completion (no residual MOVE)."
+                )
                 return INTERRUPT_RESUMED
 
             resume_cmd = (
@@ -943,17 +1019,23 @@ class NavigationNode(Node):
             if resume_result == "DONE":
                 self.has_remaining_move = False
                 self.remaining_move_distance = 0.0
+                # Resume completed the original interrupted MOVE.
+                self.update_pose_after_successful_command(
+                    command,
+                    context="dynamic-resume",
+                )
+                self.get_logger().info(
+                    "Pose updated after dynamic resume completion (resumed MOVE)."
+                )
                 return INTERRUPT_RESUMED
             else:
                 return INTERRUPT_FAILED
 
         if upper.startswith("ROTATE"):
-            self.get_logger().info(f"Resuming ROTATE: {command}")
-            self.current_executing_command = command
-            self.command_active = True
-            resume_result = self.send_command_and_wait(command)
-            self.command_active = False
-            return INTERRUPT_RESUMED if resume_result == "DONE" else INTERRUPT_FAILED
+            self.get_logger().error(
+                "Unexpected obstacle interrupt during ROTATE; not attempting rotate resume."
+            )
+            return INTERRUPT_FAILED
 
         return INTERRUPT_RESUMED
 
@@ -1118,7 +1200,8 @@ class NavigationNode(Node):
         Generate and execute the Manhattan command sequence.
 
         If successful:
-            update current_pose = target_pose
+            current_pose has already been updated incrementally; apply a final
+            snap correction to target_pose.
 
         If failed:
             send STOP
@@ -1175,6 +1258,7 @@ class NavigationNode(Node):
             result = self.send_command_and_wait(command)
 
             if result == "DONE":
+                self.update_pose_after_successful_command(command, context="normal")
                 if self.is_motion_command(command):
                     self.command_active = False
                 pass  # continue to next command
@@ -1230,7 +1314,7 @@ class NavigationNode(Node):
             else:
                 time.sleep(0.2)
 
-        # Update logical pose only after full success.
+        # Final snap correction after all incremental updates and full success.
         self.current_pose = Pose2D(
             x=normalized_target.x,
             y=normalized_target.y,
