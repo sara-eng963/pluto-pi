@@ -201,6 +201,7 @@ class NavigationNode(Node):
         # Used to ignore stale obstacle events received while idle.
         self.navigation_active = False
         self.command_active = False
+        self.static_avoidance_active = False
 
         self.active_target_pose = None
         self.static_avoidance_count = 0
@@ -277,6 +278,12 @@ class NavigationNode(Node):
         """
 
         event = msg.data.strip()
+
+        if self.static_avoidance_active:
+            self.get_logger().info(
+                f"Ignoring obstacle event during static avoidance: {event}"
+            )
+            return
 
         if not self.navigation_active:
             self.get_logger().info(
@@ -489,7 +496,7 @@ class NavigationNode(Node):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.01)
 
-            if self.interrupt_requested:
+            if self.interrupt_requested and not self.static_avoidance_active:
                 return "INTERRUPTED"
 
             if self.done_received:
@@ -658,7 +665,7 @@ class NavigationNode(Node):
             self.last_status_text = ""
             self.publish_command("STATUS")
 
-            if self.wait_for_status_response(timeout_sec=0.5):
+            if self.wait_for_status_response(timeout_sec=1.0):
                 is_active = self.parse_status_active_flag(self.last_status_text)
 
                 if is_active is False:
@@ -845,6 +852,14 @@ class NavigationNode(Node):
             avoid_heading = self.left_of_heading(interrupted_heading)
             self.get_logger().info(f"Static avoidance heading: {avoid_heading:.0f}")
 
+            # Clear original interruption state before running explicit sidestep
+            # commands; otherwise wait_for_done may immediately return INTERRUPTED.
+            self.interrupt_requested = False
+            self.obstacle_active = False
+            self.waiting_dynamic_clear = False
+            self.static_blocked = False
+            self.static_avoidance_active = True
+
             avoidance_commands = [
                 f"ROTATE {avoid_heading:.0f}",
                 f"MOVE {STATIC_AVOIDANCE_DISTANCE:.2f} {avoid_heading:.0f}",
@@ -858,6 +873,7 @@ class NavigationNode(Node):
                     self.get_logger().error(
                         f"Static avoidance command failed: {avoid_cmd}"
                     )
+                    self.static_avoidance_active = False
                     self.send_stop()
                     return INTERRUPT_FAILED
 
@@ -867,6 +883,7 @@ class NavigationNode(Node):
             )
             self.apply_move_to_logical_pose(STATIC_AVOIDANCE_DISTANCE, avoid_heading)
             self.current_pose.yaw = interrupted_heading
+            self.static_avoidance_active = False
 
             self.interrupt_requested = False
             self.obstacle_active = False
