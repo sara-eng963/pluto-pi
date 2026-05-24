@@ -357,7 +357,7 @@ class NavigationNode(Node):
         start_time = time.time()
 
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            rclpy.spin_once(self, timeout_sec=0.01)
 
             if self.ack_received:
                 return True
@@ -387,7 +387,7 @@ class NavigationNode(Node):
         start_time = time.time()
 
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            rclpy.spin_once(self, timeout_sec=0.01)
 
             if self.last_status:
                 return True
@@ -412,7 +412,7 @@ class NavigationNode(Node):
         start_time = time.time()
 
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            rclpy.spin_once(self, timeout_sec=0.01)
 
             if self.last_status_text.startswith("STATUS"):
                 return True
@@ -442,7 +442,7 @@ class NavigationNode(Node):
         start_time = time.time()
 
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            rclpy.spin_once(self, timeout_sec=0.01)
 
             if self.interrupt_requested:
                 return "INTERRUPTED"
@@ -671,7 +671,7 @@ class NavigationNode(Node):
         """
 
         while rclpy.ok():
-            rclpy.spin_once(self, timeout_sec=0.05)
+            rclpy.spin_once(self, timeout_sec=0.01)
 
             if self.static_blocked:
                 return "STATIC"
