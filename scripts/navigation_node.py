@@ -139,6 +139,11 @@ class NavigationNode(Node):
             "/mission_reset_obstacle",
             10,
         )
+        self.navigation_result_pub = self.create_publisher(
+            String,
+            "/navigation_result",
+            10,
+        )
 
         # ---------------------------------------------------------------------
         # ROS subscriber from ESP
@@ -449,6 +454,22 @@ class NavigationNode(Node):
         msg.data = True
         self.mission_reset_pub.publish(msg)
         self.get_logger().info("Published /mission_reset_obstacle = true")
+
+    def publish_navigation_result(self, event: str, target_pose=None):
+        msg = String()
+
+        if target_pose is None:
+            msg.data = event
+        else:
+            msg.data = (
+                f"{event} "
+                f"x={target_pose.x:.3f} "
+                f"y={target_pose.y:.3f} "
+                f"yaw={target_pose.yaw:.1f}"
+            )
+
+        self.navigation_result_pub.publish(msg)
+        self.get_logger().info(f"PUB /navigation_result: {msg.data}")
 
     def is_motion_command(self, command: str) -> bool:
         """
@@ -1541,6 +1562,7 @@ def main(args=None):
 
             if result == "STOP":
                 node.send_stop()
+                node.publish_navigation_result("NAV_STOPPED")
                 continue
 
             if result == "POSE":
@@ -1558,11 +1580,14 @@ def main(args=None):
                 f"yaw={target_pose.yaw:.1f}"
             )
 
+            node.publish_navigation_result("NAV_STARTED", target_pose)
             success = node.execute_navigation_to(target_pose)
 
             if success:
+                node.publish_navigation_result("NAV_DONE", target_pose)
                 print("Navigation succeeded.")
             else:
+                node.publish_navigation_result("NAV_FAILED", target_pose)
                 print("Navigation failed.")
 
             print()

@@ -72,6 +72,31 @@ class MissionNode(Node):
             "/obstacle_event",
             10,
         )
+        self.esp2_traffic_pub = self.create_publisher(
+            String,
+            "/esp2/traffic_cmd",
+            10,
+        )
+        self.esp2_gripper_pub = self.create_publisher(
+            String,
+            "/esp2/gripper_cmd",
+            10,
+        )
+        self.esp2_position_pub = self.create_publisher(
+            Int32,
+            "/esp2/position_cmd",
+            10,
+        )
+
+        self.navigation_result_sub = self.create_subscription(
+            String,
+            "/navigation_result",
+            self.navigation_result_callback,
+            10,
+        )
+
+        self.current_traffic = None
+        self.storage_sequence_running = False
 
         self.get_logger().info("Mission node started.")
         self.get_logger().info("Obstacle logic active.")
@@ -104,6 +129,7 @@ class MissionNode(Node):
         self.state = "CLEAR"
         self.obstacle_start_time = None
         self.previous_mask = self.latest_mask
+        self._set_traffic("Y")
 
         self.get_logger().info("EVENT: OBSTACLE_STATE_RESET")
         self.get_logger().info("STATE: CLEAR")
@@ -113,6 +139,119 @@ class MissionNode(Node):
         msg.data = event
         self.obstacle_event_pub.publish(msg)
         self.get_logger().info(f"PUB /obstacle_event: {event}")
+
+    def _set_traffic(self, signal: str):
+        if self.current_traffic == signal:
+            return
+
+        self.current_traffic = signal
+
+        msg = String()
+        msg.data = signal
+        self.esp2_traffic_pub.publish(msg)
+        self.get_logger().info(f"PUB /esp2/traffic_cmd: {signal}")
+
+    def _send_gripper_cmd(self, command: str):
+        msg = String()
+        msg.data = command
+        self.esp2_gripper_pub.publish(msg)
+        self.get_logger().info(f"PUB /esp2/gripper_cmd: {command}")
+
+    def _send_position_cmd(self, position: int):
+        msg = Int32()
+        msg.data = position
+        self.esp2_position_pub.publish(msg)
+        self.get_logger().info(f"PUB /esp2/position_cmd: {position}")
+
+    def _parse_navigation_result_pose(self, text: str):
+        x = 0.0
+        y = 0.0
+        yaw = 0.0
+
+        for part in text.split():
+            if part.startswith("x="):
+                try:
+                    x = float(part[2:])
+                except ValueError:
+                    pass
+            elif part.startswith("y="):
+                try:
+                    y = float(part[2:])
+                except ValueError:
+                    pass
+            elif part.startswith("yaw="):
+                try:
+                    yaw = float(part[4:])
+                except ValueError:
+                    pass
+
+        return x, y, yaw
+
+    def run_storage_sequence(self):
+        if self.storage_sequence_running:
+            self.get_logger().warn("Storage sequence already running. Ignoring duplicate request.")
+            return
+
+        self.storage_sequence_running = True
+        self.get_logger().info("Starting storage sequence.")
+
+        self._send_gripper_cmd("open_lock")
+        time.sleep(0.5)
+
+        self._send_gripper_cmd("open_gripper")
+        time.sleep(0.7)
+
+        self._send_gripper_cmd("close_gripper")
+        time.sleep(0.7)
+
+        self._send_gripper_cmd("open_lid")
+        time.sleep(0.7)
+
+        self._send_position_cmd(90)
+        time.sleep(2.0)
+
+        self._send_gripper_cmd("open_gripper")
+        time.sleep(0.7)
+
+        self._send_position_cmd(0)
+        time.sleep(2.0)
+
+        self._send_gripper_cmd("close_lid")
+        time.sleep(0.7)
+
+        self._send_gripper_cmd("close_lock")
+        time.sleep(0.5)
+
+        self.storage_sequence_running = False
+        self.get_logger().info("Storage sequence complete.")
+
+    def navigation_result_callback(self, msg: String):
+        text = msg.data.strip()
+        self.get_logger().info(f"RX /navigation_result: {text}")
+
+        if text.startswith("NAV_STARTED"):
+            self._set_traffic("Y")
+            return
+
+        if text.startswith("NAV_STOPPED"):
+            self._set_traffic("O")
+            return
+
+        if text.startswith("NAV_FAILED"):
+            self._set_traffic("R")
+            return
+
+        if text.startswith("NAV_DONE"):
+            self._set_traffic("G")
+
+            x, y, yaw = self._parse_navigation_result_pose(text)
+
+            if abs(x) < 1e-6 and abs(y) < 1e-6:
+                self.get_logger().info("Reached HOME x=0 y=0. Storage sequence skipped.")
+                return
+
+            self.run_storage_sequence()
+            return
 
     def obstacle_callback(self, msg: Int32):
         self.latest_mask = msg.data
@@ -135,6 +274,7 @@ class MissionNode(Node):
                 self.obstacle_start_time = now
                 self.get_logger().info("STATE: WAITING_FOR_CLEAR")
                 self._publish_obstacle_event(f"OBSTACLE_DETECTED mask={self.latest_mask}")
+                self._set_traffic("R")
 
             return
 
@@ -151,6 +291,7 @@ class MissionNode(Node):
                 self.obstacle_start_time = now
                 self.get_logger().info("STATE: WAITING_FOR_CLEAR")
                 self._publish_obstacle_event(f"OBSTACLE_DETECTED mask={self.latest_mask}")
+                self._set_traffic("R")
 
         # ---------------------------------------------------------------------
         # STATE: WAITING_FOR_CLEAR
@@ -162,8 +303,10 @@ class MissionNode(Node):
                 self.obstacle_start_time = None
                 self.get_logger().info("STATE: CLEAR")
                 self._publish_obstacle_event("DYNAMIC_OBSTACLE_CLEARED")
+                self._set_traffic("Y")
 
             else:
+                self._set_traffic("R")
                 elapsed = now - self.obstacle_start_time
 
                 if elapsed >= self.STATIC_CONFIRM_TIME:
@@ -174,6 +317,7 @@ class MissionNode(Node):
                     self.state = "STATIC_LOCKED"
                     self.get_logger().info("STATE: STATIC_LOCKED")
                     self._publish_obstacle_event(f"STATIC_OBSTACLE mask={self.latest_mask}")
+                    self._set_traffic("R")
 
         # ---------------------------------------------------------------------
         # STATE: STATIC_LOCKED
@@ -182,7 +326,7 @@ class MissionNode(Node):
             # Intentionally do nothing.
             # After static classification, clearing the sensor should not reset
             # the state because the robot may be turning away to reroute.
-            pass
+            self._set_traffic("R")
 
         self.previous_mask = self.latest_mask
 
