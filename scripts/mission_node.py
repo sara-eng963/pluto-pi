@@ -195,32 +195,32 @@ class MissionNode(Node):
         self.storage_sequence_running = True
         self.get_logger().info("Starting storage sequence.")
 
-        self._send_gripper_cmd("open_lock")
-        time.sleep(0.5)
+        # self._send_gripper_cmd("open_lock")
+        # time.sleep(0.5)
 
-        self._send_gripper_cmd("open_gripper")
-        time.sleep(0.7)
+       # self._send_gripper_cmd("open_gripper")
+       # time.sleep(0.7)
 
-        self._send_gripper_cmd("close_gripper")
-        time.sleep(0.7)
+        #self._send_gripper_cmd("close_gripper")
+        #time.sleep(0.7)
 
-        self._send_gripper_cmd("open_lid")
-        time.sleep(0.7)
+       # self._send_gripper_cmd("open_lid")
+       # time.sleep(0.7)
 
         self._send_position_cmd(90)
-        time.sleep(2.0)
+        time.sleep(3.0)
 
-        self._send_gripper_cmd("open_gripper")
-        time.sleep(0.7)
+        #self._send_gripper_cmd("open_gripper")
+        #time.sleep(0.7)
 
         self._send_position_cmd(0)
-        time.sleep(2.0)
+        time.sleep(3.0)
 
-        self._send_gripper_cmd("close_lid")
-        time.sleep(0.7)
+        #self._send_gripper_cmd("close_lid")
+        #time.sleep(0.7)
 
-        self._send_gripper_cmd("close_lock")
-        time.sleep(0.5)
+        #self._send_gripper_cmd("close_lock")
+        #time.sleep(0.5)
 
         self.storage_sequence_running = False
         self.get_logger().info("Storage sequence complete.")
