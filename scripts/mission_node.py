@@ -204,20 +204,20 @@ class MissionNode(Node):
         self._send_gripper_cmd("close_gripper")
         time.sleep(1.5)
 
-       # self._send_gripper_cmd("open_lid")
-       # time.sleep(0.7)
+        self._send_gripper_cmd("open_lid")
+        time.sleep(1.0)
 
         self._send_position_cmd(90)
-        time.sleep(3.0)
+        time.sleep(4.0)
 
         self._send_gripper_cmd("open_gripper")
         time.sleep(1.5)
 
         self._send_position_cmd(0)
-        time.sleep(3.0)
+        time.sleep(4.0)
 
-        #self._send_gripper_cmd("close_lid")
-        #time.sleep(0.7)
+        self._send_gripper_cmd("close_lid")
+        time.sleep(1.0)
 
         self._send_gripper_cmd("close_lock")
         time.sleep(1.0)
