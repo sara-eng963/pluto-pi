@@ -18,6 +18,7 @@ install(
     scripts/navigation_node.py
     scripts/obstacle_detection_test.py
     scripts/mission_node.py
+    scripts/test_camera.py
   DESTINATION lib/${PROJECT_NAME}
 )
 # Install launch files
