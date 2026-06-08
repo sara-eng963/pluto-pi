@@ -1,189 +1,296 @@
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from std_msgs.msg import String, Bool
-from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
-from geometry_msgs.msg import PointStamped
-from cv_bridge import CvBridge
-import tensorflow as tf
+#!/usr/bin/env python3
+
 import cv2
+import time
 import numpy as np
 
-class FruitVisionNode(Node):
+import rclpy
+from rclpy.node import Node
+
+from std_msgs.msg import String, Float32, Bool
+
+from ai_edge_litert.interpreter import Interpreter
+
+
+class VisionNode(Node):
     def __init__(self):
-        super().__init__('fruit_vision_node')
+        super().__init__("vision_node")
 
-        # ── state ────────────────────────────────────────────────
-        self.requested_item = None      # fruit requested by user
-        self.vision_active = False      # camera on/off
-        self.bridge = CvBridge()
-        self.frame_count = 0  # Debug counter
+        # =========================
+        # Paths
+        # =========================
+        self.camera_device = "/dev/video0"
+        self.model_path = "/home/pluto/design_ws/src/pluto/models/fruit_model.tflite"
+        self.classes_path = "/home/pluto/design_ws/src/pluto/models/classes.txt"
 
-        # ── parameters ───────────────────────────────────────────
-        self.declare_parameter('model_path', '/home/pluto/design_ws/src/pluto/models/fruit_model.keras')
-        self.declare_parameter('classes_path', '/home/pluto/design_ws/src/pluto/models/classes.txt')
-        self.declare_parameter('conf_threshold', 0.75)
-        self.declare_parameter('roi_size', 320)
-        self.declare_parameter('roi_y_ratio', 0.85)
-        
-        model_path = self.get_parameter('model_path').get_parameter_value().string_value
-        classes_path = self.get_parameter('classes_path').get_parameter_value().string_value
-        self.conf = self.get_parameter('conf_threshold').get_parameter_value().double_value
-        self.roi_size = self.get_parameter('roi_size').get_parameter_value().integer_value
-        self.roi_y_ratio = self.get_parameter('roi_y_ratio').get_parameter_value().double_value
-        
-        # Load model
-        self.model = tf.keras.models.load_model(model_path)
-        self.get_logger().info(f'✅ TensorFlow model loaded: {model_path}')
-        
+        # =========================
+        # ROI settings
+        # Camera frame is 640x480
+        # =========================
+        self.roi_x = 160
+        self.roi_y = 80
+        self.roi_w = 420
+        self.roi_h = 380
+
+        # =========================
+        # Detection settings
+        # =========================
+        self.confidence_threshold = 0.70
+        self.confirm_required = 5
+
+        self.ordered_fruit = ""
+
+        self.last_label = None
+        self.confirm_count = 0
+        self.confidence_buffer = []
+
+        self.detected_fruit = "Unknown"
+        self.detected_confidence = 0.0
+        self.valid = False
+
+        # =========================
+        # ROS interfaces
+        # =========================
+        self.order_sub = self.create_subscription(
+            String,
+            "/ordered_fruit",
+            self.ordered_fruit_callback,
+            10
+        )
+
+        self.detected_fruit_pub = self.create_publisher(
+            String,
+            "/detected_fruit",
+            10
+        )
+
+        self.detected_confidence_pub = self.create_publisher(
+            Float32,
+            "/detected_confidence",
+            10
+        )
+
+        self.valid_pub = self.create_publisher(
+            Bool,
+            "/valid",
+            10
+        )
+
+        # =========================
         # Load classes
-        with open(classes_path, 'r') as f:
-            self.class_names = [line.strip() for line in f if line.strip()]
-        self.get_logger().info(f'📋 Classes: {self.class_names}')
-        
-        # Model input size
-        self.img_size = (224, 224)
-        
-        # ── subscribers ──────────────────────────────────────────
-        self.create_subscription(String, '/from_user', self.user_callback, 10)
-        self.create_subscription(Bool, '/activate_vision', self.activation_callback, 10)
-        self.create_subscription(Image, '/image_raw', self.image_callback, 10)
+        # =========================
+        with open(self.classes_path, "r") as f:
+            self.classes = [line.strip() for line in f.readlines() if line.strip()]
 
-        # ── publishers ───────────────────────────────────────────
-        self.item_pub = self.create_publisher(String, '/item', 10)
-        self.det_pub = self.create_publisher(Detection2DArray, '/fruit/detections', 10)
-        self.pick_pub = self.create_publisher(PointStamped, '/fruit/pick_target', 10)
-        self.viz_pub = self.create_publisher(Image, '/fruit/visualization', 10)
+        self.get_logger().info("Loaded classes:")
+        for i, name in enumerate(self.classes):
+            self.get_logger().info(f"{i}: {name}")
 
-        self.get_logger().info('🍎 Fruit Vision Node ready. Waiting for activation...')
+        # =========================
+        # Load TFLite model
+        # =========================
+        self.interpreter = Interpreter(model_path=self.model_path)
+        self.interpreter.allocate_tensors()
 
-    def user_callback(self, msg):
-        self.requested_item = msg.data.strip().lower()
-        self.get_logger().info(f'🎯 Requested item set to: {self.requested_item}')
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
 
-    def activation_callback(self, msg):
-        self.vision_active = msg.data
-        state = 'ON' if msg.data else 'OFF'
-        self.get_logger().info(f'📷 Vision activated: {state}')
+        self.input_shape = self.input_details[0]["shape"]
+        self.input_dtype = self.input_details[0]["dtype"]
 
-    def get_roi(self, frame):
-        h, w = frame.shape[:2]
-        
-        roi_half = self.roi_size // 2
-        center_x = w // 2
-        
-        x1 = center_x - roi_half
-        x2 = center_x + roi_half
-        y2 = int(h * self.roi_y_ratio)
-        y1 = y2 - self.roi_size
-        
-        x1 = max(0, x1)
-        x2 = min(w, x2)
-        y1 = max(0, y1)
-        y2 = min(h, y2)
-        
-        roi = frame[y1:y2, x1:x2]
-        return roi, (x1, y1, x2, y2)
+        self.model_h = int(self.input_shape[1])
+        self.model_w = int(self.input_shape[2])
 
-    def classify_roi(self, roi):
+        self.get_logger().info(f"Model input shape: {self.input_shape}")
+        self.get_logger().info(f"Model input dtype: {self.input_dtype}")
+        self.get_logger().info(f"Model input size: {self.model_w} x {self.model_h}")
+
+        # =========================
+        # Open camera
+        # =========================
+        self.cap = cv2.VideoCapture(self.camera_device, cv2.CAP_V4L2)
+
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+
+        if not self.cap.isOpened():
+            self.get_logger().error("Camera failed to open")
+            raise RuntimeError("Camera failed to open")
+
+        self.get_logger().info("Camera opened successfully")
+        self.get_logger().info("Vision node started")
+        self.get_logger().info("Waiting for /ordered_fruit...")
+
+        # =========================
+        # FPS/debug
+        # =========================
+        self.frame_count = 0
+        self.start_time = time.time()
+
+        # 20 Hz processing timer
+        self.timer = self.create_timer(0.05, self.process_frame)
+
+    def ordered_fruit_callback(self, msg):
+        new_order = msg.data.strip()
+
+        self.ordered_fruit = new_order
+
+        # Reset confirmation state when order changes
+        self.last_label = None
+        self.confirm_count = 0
+        self.confidence_buffer = []
+
+        self.detected_fruit = "Unknown"
+        self.detected_confidence = 0.0
+        self.valid = False
+
+        self.get_logger().info(f"Received ordered fruit: {self.ordered_fruit}")
+
+    def preprocess_roi(self, frame):
+        roi = frame[
+            self.roi_y:self.roi_y + self.roi_h,
+            self.roi_x:self.roi_x + self.roi_w
+        ]
+
         if roi.size == 0:
-            return "unknown", 0.0
-        
-        rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        rgb = cv2.resize(rgb, self.img_size)
-        x = np.expand_dims(rgb, axis=0).astype(np.float32) / 255.0
-        
-        probs = self.model.predict(x, verbose=0)[0]
-        
-        top_idx = int(np.argmax(probs))
-        top_name = self.class_names[top_idx]
-        top_prob = float(probs[top_idx])
-        
-        if top_prob >= self.conf:
-            return top_name, top_prob
-        return "unknown", top_prob
+            return None
 
-    def image_callback(self, msg):
-        self.frame_count += 1
-        
-        
-        # Do nothing if vision is not active or no fruit requested
-        if not self.vision_active or self.requested_item is None:
+        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(roi_rgb, (self.model_w, self.model_h))
+
+        input_data = np.expand_dims(resized, axis=0)
+
+        if self.input_dtype == np.float32:
+            input_data = input_data.astype(np.float32) / 255.0
+        else:
+            input_data = input_data.astype(self.input_dtype)
+
+        return input_data
+
+    def run_inference(self, input_data):
+        self.interpreter.set_tensor(self.input_details[0]["index"], input_data)
+        self.interpreter.invoke()
+
+        output = self.interpreter.get_tensor(self.output_details[0]["index"])[0]
+
+        class_id = int(np.argmax(output))
+        confidence = float(output[class_id])
+
+        if class_id < len(self.classes):
+            label = self.classes[class_id]
+        else:
+            label = f"class_{class_id}"
+
+        return label, confidence, output
+
+    def update_confirmation_filter(self, label, confidence):
+        # Low confidence = Unknown
+        if confidence < self.confidence_threshold:
+            label = "Unknown"
+
+        if label == self.last_label:
+            self.confirm_count += 1
+            self.confidence_buffer.append(confidence)
+        else:
+            self.last_label = label
+            self.confirm_count = 1
+            self.confidence_buffer = [confidence]
+
+        if self.confirm_count >= self.confirm_required:
+            self.detected_fruit = label
+            self.detected_confidence = float(np.mean(self.confidence_buffer[-self.confirm_required:]))
+
+            if (
+                self.ordered_fruit != ""
+                and self.detected_fruit == self.ordered_fruit
+                and self.detected_fruit != "Unknown"
+            ):
+                self.valid = True
+            else:
+                self.valid = False
+
+            self.publish_detection()
+
+    def publish_detection(self):
+        fruit_msg = String()
+        fruit_msg.data = self.detected_fruit
+
+        confidence_msg = Float32()
+        confidence_msg.data = float(self.detected_confidence)
+
+        valid_msg = Bool()
+        valid_msg.data = bool(self.valid)
+
+        self.detected_fruit_pub.publish(fruit_msg)
+        self.detected_confidence_pub.publish(confidence_msg)
+        self.valid_pub.publish(valid_msg)
+
+    def process_frame(self):
+        ret, frame = self.cap.read()
+
+        if not ret:
+            self.get_logger().warn("Frame read failed")
             return
 
-        try:
-            # Convert ROS image to OpenCV
-            frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-            
-            # Get fixed ROI
-            roi, (x1, y1, x2, y2) = self.get_roi(frame)
-            
-            # Prepare detection message
-            detection_array = Detection2DArray()
-            detection_array.header = msg.header
-            
-            # Classify the ROI
-            label, confidence = self.classify_roi(roi)
-            
-            # Build detection message
-            det = Detection2D()
-            hyp = ObjectHypothesisWithPose()
-            hyp.hypothesis.class_id = label
-            hyp.hypothesis.score = confidence
-            det.results.append(hyp)
-            
-            cx = float((x1 + x2) / 2)
-            cy = float((y1 + y2) / 2)
-            det.bbox.center.position.x = cx
-            det.bbox.center.position.y = cy
-            det.bbox.size_x = float(x2 - x1)
-            det.bbox.size_y = float(y2 - y1)
-            detection_array.detections.append(det)
-            
-            self.det_pub.publish(detection_array)
-            
-            item_msg = String()
-            
-            if label.lower() == self.requested_item:
-                item_msg.data = 'CORRECT'
-                self.item_pub.publish(item_msg)
-                
-                pt = PointStamped()
-                pt.header = msg.header
-                pt.point.x = cx
-                pt.point.y = cy
-                pt.point.z = 0.0
-                self.pick_pub.publish(pt)
-                
-                self.get_logger().info(f'✅ CORRECT — {self.requested_item} at ({cx:.0f},{cy:.0f}) conf={confidence:.2f}')
-            else:
-                item_msg.data = 'INCORRECT'
-                self.item_pub.publish(item_msg)
-                self.get_logger().info(f'❌ INCORRECT — wanted: {self.requested_item} | detected: {label} (conf={confidence:.2f})')
-            
-            # Draw visualization
-            color = (0, 255, 0) if label == self.requested_item else (0, 0, 255)
-            text = f"{label.upper()} ({confidence:.2f})"
-            
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 2)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(frame, text, (x1, max(25, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-            
-            self.viz_pub.publish(self.bridge.cv2_to_imgmsg(frame, 'bgr8'))
-            
-        except Exception as e:
-            self.get_logger().error(f'Error in image_callback: {e}')
+        input_data = self.preprocess_roi(frame)
+
+        if input_data is None:
+            self.get_logger().warn("ROI crop failed")
+            return
+
+        label, confidence, output = self.run_inference(input_data)
+
+        self.update_confirmation_filter(label, confidence)
+
+        self.frame_count += 1
+        elapsed = time.time() - self.start_time
+
+        if elapsed >= 1.0:
+            fps = self.frame_count / elapsed
+
+            self.get_logger().info(
+                f"FPS: {fps:.2f} | "
+                f"Order: {self.ordered_fruit if self.ordered_fruit else 'None'} | "
+                f"Current: {label} ({confidence:.3f}) | "
+                f"Confirmed: {self.detected_fruit} ({self.detected_confidence:.3f}) | "
+                f"Valid: {self.valid} | "
+                f"Count: {self.confirm_count}/{self.confirm_required}"
+            )
+
+            self.frame_count = 0
+            self.start_time = time.time()
+
+    def destroy_node(self):
+        if hasattr(self, "cap") and self.cap is not None:
+            self.cap.release()
+            self.get_logger().info("Camera released")
+
+        super().destroy_node()
+
 
 def main(args=None):
     rclpy.init(args=args)
-    node = FruitVisionNode()
+
+    node = None
+
     try:
+        node = VisionNode()
         rclpy.spin(node)
+
     except KeyboardInterrupt:
         pass
+
+    except Exception as e:
+        print(f"Vision node error: {e}")
+
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
+
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
