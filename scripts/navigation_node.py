@@ -62,6 +62,8 @@ Example:
 """
 
 import time
+import queue
+import threading
 from dataclasses import dataclass
 from typing import List, Union
 
@@ -186,6 +188,7 @@ class NavigationNode(Node):
 
         # Latest full STATUS text from ESP1.
         self.last_status_text = ""
+        self.real_yaw_from_esp = None
 
         # ---- Obstacle handling flags ----------------------------------------
         self.obstacle_active = False
@@ -223,6 +226,8 @@ class NavigationNode(Node):
             10,
         )
 
+        self.real_yaw_timer = self.create_timer(1.0, self.request_real_yaw_status)
+
         self.get_logger().info("Navigation node started.")
         self.log_current_pose()
 
@@ -254,7 +259,12 @@ class NavigationNode(Node):
         # STATUS is a valid immediate response, not a motion completion.
         if text.startswith("STATUS"):
             self.last_status_text = text
-            self.ack_received = True
+
+            yaw = self.extract_status_float(text, "yaw")
+            if yaw is not None:
+                self.real_yaw_from_esp = yaw
+                self.get_logger().info(f"REAL ESP YAW: {yaw:.1f} deg")
+
             return
 
         # STOP response may be "STOPPED" or similar.
@@ -384,6 +394,21 @@ class NavigationNode(Node):
 
         self.cmd_pub.publish(msg)
         self.get_logger().info(f"SEND: {command}")
+
+    def request_real_yaw_status(self):
+        if self.command_active:
+            return
+        self.publish_command("STATUS")
+
+    def extract_status_float(self, status_text: str, key: str):
+        prefix = key + "="
+        for part in status_text.split():
+            if part.startswith(prefix):
+                try:
+                    return float(part[len(prefix):])
+                except ValueError:
+                    return None
+        return None
 
     def update_pose_after_successful_command(self, command: str, context: str):
         """
@@ -1526,15 +1551,38 @@ def main(args=None):
 
     print_help()
 
+    input_queue = queue.Queue()
+    input_stop_event = threading.Event()
+
+    def terminal_input_reader():
+        while rclpy.ok() and not input_stop_event.is_set():
+            try:
+                line = input("nav> ")
+            except EOFError:
+                input_queue.put("__EOF__")
+                break
+
+            input_queue.put(line)
+
+    input_thread = threading.Thread(target=terminal_input_reader, daemon=True)
+    input_thread.start()
+
     try:
         # First check that ESP is alive.
         node.send_command_and_wait("STATUS")
 
         while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.1)
+
             try:
-                line = input("nav> ").strip()
-            except EOFError:
+                line = input_queue.get_nowait()
+            except queue.Empty:
+                continue
+
+            if line == "__EOF__":
                 break
+
+            line = line.strip()
 
             if not line:
                 continue
@@ -1595,6 +1643,8 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().warn("Keyboard interrupt detected. Sending STOP.")
         node.send_stop()
+
+    input_stop_event.set()
 
     node.destroy_node()
     rclpy.shutdown()
