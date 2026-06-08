@@ -11,6 +11,9 @@ MODEL_PATH = "/home/pluto/design_ws/src/pluto/models/fruit_model.tflite"
 CLASSES_PATH = "/home/pluto/design_ws/src/pluto/models/classes.txt"
 
 # ROI settings
+# Camera frame is 640x480
+# x = horizontal direction
+# y = vertical direction
 ROI_X = 160
 ROI_Y = 80
 ROI_W = 420
@@ -19,6 +22,10 @@ ROI_H = 380
 # Load class names
 with open(CLASSES_PATH, "r") as f:
     classes = [line.strip() for line in f.readlines() if line.strip()]
+
+print("Classes:")
+for i, name in enumerate(classes):
+    print(f"{i}: {name}")
 
 # Load TFLite model
 interpreter = Interpreter(model_path=MODEL_PATH)
@@ -54,6 +61,7 @@ print("Running ROI TFLite inference. Press CTRL+C to stop.")
 
 frame_count = 0
 start_time = time.time()
+saved_debug = False
 
 try:
     while True:
@@ -66,13 +74,52 @@ try:
         # Crop ROI from full frame
         roi = frame[ROI_Y:ROI_Y + ROI_H, ROI_X:ROI_X + ROI_W]
 
-        # Convert BGR to RGB because OpenCV uses BGR
+        # Safety check
+        if roi.size == 0:
+            print("ROI crop failed. Check ROI values.")
+            continue
+
+        # Convert BGR to RGB because OpenCV uses BGR and most models expect RGB
         roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
 
         # Resize ROI to model input size
         resized = cv2.resize(roi_rgb, (model_w, model_h))
 
-        # Add batch dimension
+        # Save debug images once
+        if not saved_debug:
+            frame_with_roi = frame.copy()
+
+            cv2.rectangle(
+                frame_with_roi,
+                (ROI_X, ROI_Y),
+                (ROI_X + ROI_W, ROI_Y + ROI_H),
+                (0, 255, 0),
+                2
+            )
+
+            cv2.putText(
+                frame_with_roi,
+                "ROI",
+                (ROI_X, ROI_Y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 0),
+                2
+            )
+
+            debug_model_input_bgr = cv2.cvtColor(resized, cv2.COLOR_RGB2BGR)
+
+            cv2.imwrite("debug_full_frame_with_roi.jpg", frame_with_roi)
+            cv2.imwrite("debug_roi_raw.jpg", roi)
+            cv2.imwrite("debug_model_input.jpg", debug_model_input_bgr)
+
+            print("Saved debug_full_frame_with_roi.jpg")
+            print("Saved debug_roi_raw.jpg")
+            print("Saved debug_model_input.jpg")
+
+            saved_debug = True
+
+        # Add batch dimension: (224, 224, 3) -> (1, 224, 224, 3)
         input_data = np.expand_dims(resized, axis=0)
 
         # Match model input type
@@ -87,8 +134,20 @@ try:
 
         output = interpreter.get_tensor(output_details[0]["index"])[0]
 
-        print("\nRaw output:", output)
+        # Get prediction
+        class_id = int(np.argmax(output))
+        confidence = float(output[class_id])
 
+        if class_id < len(classes):
+            label = classes[class_id]
+        else:
+            label = f"class_{class_id}"
+
+        # FPS counting
+        frame_count += 1
+        elapsed = time.time() - start_time
+
+        # Print once per second
         if elapsed >= 1.0:
             fps = frame_count / elapsed
 
@@ -98,19 +157,6 @@ try:
                 name = classes[i] if i < len(classes) else f"class_{i}"
                 print(f"{i}: {name} = {float(score):.4f}")
 
-            print(f"FPS: {fps:.2f} | ROI Prediction: {label} | Confidence: {confidence:.3f}")
-
-            frame_count = 0
-            start_time = time.time()
-        class_id = int(np.argmax(output))
-        confidence = float(output[class_id])
-        label = classes[class_id]
-
-        frame_count += 1
-        elapsed = time.time() - start_time
-
-        if elapsed >= 1.0:
-            fps = frame_count / elapsed
             print(f"FPS: {fps:.2f} | ROI Prediction: {label} | Confidence: {confidence:.3f}")
 
             frame_count = 0
