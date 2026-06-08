@@ -95,8 +95,18 @@ class MissionNode(Node):
             10,
         )
 
+        self.valid_sub = self.create_subscription(
+            Bool,
+            "/valid",
+            self.valid_callback,
+            10,
+        )
+
         self.current_traffic = None
         self.storage_sequence_running = False
+        self.latest_valid = False
+        self.waiting_for_valid = False
+        self.storage_done_for_current_target = False
 
         self.get_logger().info("Mission node started.")
         self.get_logger().info("Obstacle logic active.")
@@ -225,6 +235,29 @@ class MissionNode(Node):
         self.storage_sequence_running = False
         self.get_logger().info("Storage sequence complete.")
 
+    def _start_storage_sequence_thread(self):
+        threading.Thread(
+            target=self.run_storage_sequence,
+            daemon=True,
+        ).start()
+
+    def valid_callback(self, msg: Bool):
+        self.latest_valid = msg.data
+        self.get_logger().info(f"RX /valid: {msg.data}")
+
+        if not msg.data:
+            return
+
+        if self.waiting_for_valid and (not self.storage_sequence_running) and (not self.storage_done_for_current_target):
+            self.get_logger().info("/valid became true. Starting storage sequence.")
+            self.waiting_for_valid = False
+            self.storage_done_for_current_target = True
+            self._start_storage_sequence_thread()
+            return
+
+        if self.storage_sequence_running or self.storage_done_for_current_target:
+            self.get_logger().info("Duplicate /valid=true ignored: storage already started or done for current target.")
+
     def navigation_result_callback(self, msg: String):
         text = msg.data.strip()
         self.get_logger().info(f"RX /navigation_result: {text}")
@@ -250,7 +283,16 @@ class MissionNode(Node):
                 self.get_logger().info("Reached HOME x=0 y=0. Storage sequence skipped.")
                 return
 
-            self.run_storage_sequence()
+            self.waiting_for_valid = True
+            self.storage_done_for_current_target = False
+            self.get_logger().info("Reached target. Waiting for /valid = true before storage sequence.")
+
+            if self.latest_valid:
+                if (not self.storage_sequence_running) and (not self.storage_done_for_current_target):
+                    self.get_logger().info("/valid already true at NAV_DONE. Starting storage sequence.")
+                    self.waiting_for_valid = False
+                    self.storage_done_for_current_target = True
+                    self._start_storage_sequence_thread()
             return
 
     def obstacle_callback(self, msg: Int32):
