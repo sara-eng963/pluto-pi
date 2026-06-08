@@ -70,6 +70,7 @@ from typing import List, Union
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool
+from std_msgs.msg import Float32
 from std_msgs.msg import String
 
 
@@ -144,6 +145,11 @@ class NavigationNode(Node):
         self.navigation_result_pub = self.create_publisher(
             String,
             "/navigation_result",
+            10,
+        )
+        self.debug_yaw_pub = self.create_publisher(
+            Float32,
+            "/debug_yaw",
             10,
         )
 
@@ -226,7 +232,10 @@ class NavigationNode(Node):
             10,
         )
 
-        self.real_yaw_timer = self.create_timer(1.0, self.request_real_yaw_status)
+        self.debug_yaw_timer = self.create_timer(
+            1.0,
+            self.request_debug_yaw_status,
+        )
 
         self.get_logger().info("Navigation node started.")
         self.log_current_pose()
@@ -249,22 +258,24 @@ class NavigationNode(Node):
         text = msg.data.strip()
         self.last_status = text
 
-        self.get_logger().info(f"ESP: {text}")
-
-        # Command accepted.
-        if text.startswith("ACK"):
-            self.ack_received = True
-            return
-
-        # STATUS is a valid immediate response, not a motion completion.
         if text.startswith("STATUS"):
             self.last_status_text = text
 
             yaw = self.extract_status_float(text, "yaw")
             if yaw is not None:
                 self.real_yaw_from_esp = yaw
-                self.get_logger().info(f"REAL ESP YAW: {yaw:.1f} deg")
 
+                yaw_msg = Float32()
+                yaw_msg.data = float(yaw)
+                self.debug_yaw_pub.publish(yaw_msg)
+
+            return
+
+        self.get_logger().info(f"ESP: {text}")
+
+        # Command accepted.
+        if text.startswith("ACK"):
+            self.ack_received = True
             return
 
         # STOP response may be "STOPPED" or similar.
@@ -395,10 +406,20 @@ class NavigationNode(Node):
         self.cmd_pub.publish(msg)
         self.get_logger().info(f"SEND: {command}")
 
-    def request_real_yaw_status(self):
+    def request_debug_yaw_status(self):
+        """
+        Request ESP STATUS once per second for debug yaw publishing.
+
+        Do not request during active MOVE/ROTATE commands because STATUS replies
+        can interfere with ACK/DONE waiting logic.
+        """
+
         if self.command_active:
             return
-        self.publish_command("STATUS")
+
+        msg = String()
+        msg.data = "STATUS"
+        self.cmd_pub.publish(msg)
 
     def extract_status_float(self, status_text: str, key: str):
         prefix = key + "="
