@@ -89,10 +89,19 @@ try:
 
         print("\nRaw output:", output)
 
-        for i, score in enumerate(output):
-            name = classes[i] if i < len(classes) else f"class_{i}"
-            print(f"{i}: {name} = {float(score):.4f}")
+        if elapsed >= 1.0:
+            fps = frame_count / elapsed
 
+            print("\nRaw output:", output)
+
+            for i, score in enumerate(output):
+                name = classes[i] if i < len(classes) else f"class_{i}"
+                print(f"{i}: {name} = {float(score):.4f}")
+
+            print(f"FPS: {fps:.2f} | ROI Prediction: {label} | Confidence: {confidence:.3f}")
+
+            frame_count = 0
+            start_time = time.time()
         class_id = int(np.argmax(output))
         confidence = float(output[class_id])
         label = classes[class_id]
