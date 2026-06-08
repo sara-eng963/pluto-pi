@@ -10,8 +10,8 @@ CAMERA_DEVICE = "/dev/video0"
 # y = vertical direction
 ROI_X = 160
 ROI_Y = 80
-ROI_W = 320
-ROI_H = 320
+ROI_W = 420
+ROI_H = 380
 
 cap = cv2.VideoCapture(CAMERA_DEVICE, cv2.CAP_V4L2)
 
