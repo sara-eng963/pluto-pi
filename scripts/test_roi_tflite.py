@@ -87,6 +87,12 @@ try:
 
         output = interpreter.get_tensor(output_details[0]["index"])[0]
 
+        print("\nRaw output:", output)
+
+        for i, score in enumerate(output):
+            name = classes[i] if i < len(classes) else f"class_{i}"
+            print(f"{i}: {name} = {float(score):.4f}")
+
         class_id = int(np.argmax(output))
         confidence = float(output[class_id])
         label = classes[class_id]
