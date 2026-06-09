@@ -35,6 +35,7 @@ TUNING_KEYWORDS = {
     "HKP",
     "HKI",
     "RKP",
+    "RKI",
     "RTOL",
     "VKP",
     "VKI",
@@ -300,6 +301,7 @@ def print_help() -> None:
     print("Direct ESP commands examples:")
     print("  PKP 0.8")
     print("  HKP 60")
+    print("  RKI 0.2")
     print("  VKPALL 5")
     print("  MOVE 0.30 0")
     print("  ROTATE 90")
@@ -321,6 +323,7 @@ def execute_coordinate_target(node: TestPidNode, target: Pose2D) -> None:
     print("Enter tuning commands now.")
     print("Examples:")
     print("  RKP 8")
+    print("  RKI 0.2")
     print("  RTOL 1")
     print("  HKP 60")
     print("  HKI 2")
@@ -346,7 +349,7 @@ def execute_coordinate_target(node: TestPidNode, target: Pose2D) -> None:
             return
         if lower == "help":
             print("Tune stage commands:")
-            print("  PKP/PKI/HKP/HKI/RKP/RTOL/VKP/VKI/VKPALL/VKIALL")
+            print("  PKP/PKI/HKP/HKI/RKP/RKI/RTOL/VKP/VKI/VKPALL/VKIALL")
             print("  HEADING ON|OFF, HINVERT, RINVERT, STATUS, STOP")
             print("  done, cancel")
             continue
