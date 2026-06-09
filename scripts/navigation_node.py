@@ -232,6 +232,11 @@ class NavigationNode(Node):
             10,
         )
 
+        self.debug_yaw_timer = self.create_timer(
+            1.0,
+            self.request_debug_yaw_status,
+        )
+
         self.get_logger().info("Navigation node started.")
         self.log_current_pose()
 
@@ -401,6 +406,21 @@ class NavigationNode(Node):
         self.cmd_pub.publish(msg)
         self.get_logger().info(f"SEND: {command}")
 
+    def request_debug_yaw_status(self):
+        """
+        Request ESP STATUS once per second for debug yaw publishing.
+
+        Do not request during active MOVE/ROTATE commands because STATUS replies
+        can interfere with ACK/DONE waiting logic.
+        """
+
+        if self.command_active:
+            return
+
+        msg = String()
+        msg.data = "STATUS"
+        self.cmd_pub.publish(msg)
+
     def extract_status_float(self, status_text: str, key: str):
         prefix = key + "="
         for part in status_text.split():
@@ -410,47 +430,6 @@ class NavigationNode(Node):
                 except ValueError:
                     return None
         return None
-
-    def request_and_publish_debug_yaw(self, label: str = "") -> bool:
-        """
-        Request one STATUS message from ESP1 and publish yaw= to /debug_yaw.
-
-        This is used at safe checkpoints only:
-        - before navigation starts
-        - after navigation succeeds or fails
-        - when user types status
-        """
-
-        self.reset_wait_flags()
-        self.last_status_text = ""
-
-        msg = String()
-        msg.data = "STATUS"
-        self.cmd_pub.publish(msg)
-
-        if not self.wait_for_status_response(timeout_sec=2.0):
-            self.get_logger().warn("Could not get STATUS for debug yaw.")
-            return False
-
-        yaw = self.extract_status_float(self.last_status_text, "yaw")
-        if yaw is None:
-            self.get_logger().warn(
-                f"STATUS received but yaw= field missing: {self.last_status_text}"
-            )
-            return False
-
-        self.real_yaw_from_esp = yaw
-
-        yaw_msg = Float32()
-        yaw_msg.data = float(yaw)
-        self.debug_yaw_pub.publish(yaw_msg)
-
-        if label:
-            self.get_logger().info(f"Published /debug_yaw {label}: {yaw:.1f} deg")
-        else:
-            self.get_logger().info(f"Published /debug_yaw: {yaw:.1f} deg")
-
-        return True
 
     def update_pose_after_successful_command(self, command: str, context: str):
         """
@@ -1647,7 +1626,7 @@ def main(args=None):
                 continue
 
             if result == "STATUS":
-                node.request_and_publish_debug_yaw("manual status")
+                node.send_command_and_wait("STATUS")
                 continue
 
             if result == "STOP":
@@ -1671,9 +1650,7 @@ def main(args=None):
             )
 
             node.publish_navigation_result("NAV_STARTED", target_pose)
-            node.request_and_publish_debug_yaw("before navigation")
             success = node.execute_navigation_to(target_pose)
-            node.request_and_publish_debug_yaw("after navigation")
 
             if success:
                 node.publish_navigation_result("NAV_DONE", target_pose)
