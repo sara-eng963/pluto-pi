@@ -36,10 +36,12 @@ States:
 
 import time
 import threading
+import json
 
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32, Bool, String
+from geometry_msgs.msg import Pose2D
 
 
 class MissionNode(Node):
@@ -52,6 +54,22 @@ class MissionNode(Node):
         self.latest_mask = 0
         self.previous_mask = None
         self.obstacle_start_time = None
+
+        # Mission/order state
+        self.mission_state = "idle"
+        self.active_order_id = ""
+        self.active_fruit = ""
+        self.active_user_id = ""
+        self.assigned_rfid = ""
+        self.fault_type = "none"
+
+        # Temporary hardcoded fruit poses for Stage 2
+        # Later move these to YAML parameters.
+        self.fruit_poses = {
+            "Apple": (0.5, 0.0, 0.0),
+            "Orange": (0.5, 0.5, 90.0),
+            "Kiwi": (0.0, 0.5, 90.0),
+        }
 
         self.obstacle_sub = self.create_subscription(
             Int32,
@@ -101,6 +119,63 @@ class MissionNode(Node):
             self.valid_callback,
             10,
         )
+        self.order_request_sub = self.create_subscription(
+            String,
+            "/mission/order_request",
+            self.order_request_callback,
+            10,
+        )
+
+        self.mission_control_sub = self.create_subscription(
+            String,
+            "/mission/control",
+            self.mission_control_callback,
+            10,
+        )
+
+        self.rfid_verification_sub = self.create_subscription(
+            String,
+            "/mission/rfid_verification",
+            self.rfid_verification_callback,
+            10,
+        )
+
+        self.storage_close_request_sub = self.create_subscription(
+            String,
+            "/mission/storage_close_request",
+            self.storage_close_request_callback,
+            10,
+        )
+
+        self.ordered_fruit_pub = self.create_publisher(
+            String,
+            "/ordered_fruit",
+            10,
+        )
+
+        self.navigation_goal_pub = self.create_publisher(
+            Pose2D,
+            "/navigation/goal",
+            10,
+        )
+
+        self.navigation_control_pub = self.create_publisher(
+            String,
+            "/navigation/control",
+            10,
+        )
+
+        self.mission_state_pub = self.create_publisher(
+            String,
+            "/mission/state",
+            10,
+        )
+
+        self.mission_event_pub = self.create_publisher(
+            String,
+            "/mission/event",
+            10,
+        )
 
         self.current_traffic = None
         self.storage_sequence_running = False
@@ -129,6 +204,72 @@ class MissionNode(Node):
             if user_input == "c":
                 self.get_logger().info("TERMINAL: c pressed")
                 self.reset_obstacle_state()
+
+    def _publish_string(self, publisher, data: str, topic_name: str):
+        msg = String()
+        msg.data = data
+        publisher.publish(msg)
+        self.get_logger().info(f"PUB {topic_name}: {data}")
+
+
+    def _publish_json(self, publisher, data: dict, topic_name: str):
+        text = json.dumps(data, separators=(",", ":"))
+        self._publish_string(publisher, text, topic_name)
+
+
+    def _publish_mission_state(self):
+        self._publish_json(
+            self.mission_state_pub,
+            {
+                "order_id": self.active_order_id,
+                "mission_state": self.mission_state,
+                "fruit": self.active_fruit,
+                "fault_type": self.fault_type,
+                "storage_running": self.storage_sequence_running,
+            },
+            "/mission/state",
+        )
+
+
+    def _publish_mission_event(self, event: str, message: str, progress: int = 0):
+        self._publish_json(
+            self.mission_event_pub,
+            {
+                "order_id": self.active_order_id,
+                "event": event,
+                "message": message,
+                "progress_percent": progress,
+            },
+            "/mission/event",
+        )
+
+
+    def _publish_ordered_fruit(self, fruit: str):
+        self._publish_string(
+            self.ordered_fruit_pub,
+            fruit,
+            "/ordered_fruit",
+        )
+
+
+    def _publish_navigation_goal(self, x: float, y: float, theta: float):
+        msg = Pose2D()
+        msg.x = float(x)
+        msg.y = float(y)
+        msg.theta = float(theta)
+
+        self.navigation_goal_pub.publish(msg)
+        self.get_logger().info(
+            f"PUB /navigation/goal: x={msg.x:.3f}, y={msg.y:.3f}, theta={msg.theta:.1f}"
+        )
+
+
+    def _publish_navigation_control(self, command: str):
+        self._publish_string(
+            self.navigation_control_pub,
+            command,
+            "/navigation/control",
+        )
 
     def reset_callback(self, msg: Bool):
         if msg.data:
@@ -234,12 +375,40 @@ class MissionNode(Node):
 
         self.storage_sequence_running = False
         self.get_logger().info("Storage sequence complete.")
+        if self.mission_state == "storing":
+            self._publish_mission_event(
+                "storageComplete",
+                "Storage sequence complete. Stage 2 mission finished.",
+                100,
+            )
+
+            self.mission_state = "idle"
+            self.active_order_id = ""
+            self.active_fruit = ""
+            self.active_user_id = ""
+            self.assigned_rfid = ""
+            self.fault_type = "none"
+            self.waiting_for_valid = False
+            self.storage_done_for_current_target = False
+            self._publish_mission_state()
 
     def _start_storage_sequence_thread(self):
         threading.Thread(
             target=self.run_storage_sequence,
             daemon=True,
         ).start()
+
+    def _normalize_fruit_name(self, name: str) -> str:
+        n = name.strip().lower()
+
+        if n == "apple":
+            return "Apple"
+        if n == "orange":
+            return "Orange"
+        if n == "kiwi":
+            return "Kiwi"
+
+        return name.strip()
 
     def valid_callback(self, msg: Bool):
         self.latest_valid = msg.data
@@ -248,7 +417,19 @@ class MissionNode(Node):
         if not msg.data:
             return
 
-        if self.waiting_for_valid and (not self.storage_sequence_running) and (not self.storage_done_for_current_target):
+        if (
+            self.waiting_for_valid
+            and (not self.storage_sequence_running)
+            and (not self.storage_done_for_current_target)
+        ):
+            if self.mission_state == "visionChecking":
+                self.mission_state = "storing"
+                self._publish_mission_state()
+                self._publish_mission_event(
+                    "storing",
+                    f"{self.active_fruit} validated. Starting storage sequence.",
+                    45,
+                )
             self.get_logger().info("/valid became true. Starting storage sequence.")
             self.waiting_for_valid = False
             self.storage_done_for_current_target = True
@@ -257,6 +438,58 @@ class MissionNode(Node):
 
         if self.storage_sequence_running or self.storage_done_for_current_target:
             self.get_logger().info("Duplicate /valid=true ignored: storage already started or done for current target.")
+
+    def mission_control_callback(self, msg: String):
+        self.get_logger().info(f"RX /mission/control: {msg.data}")
+
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            data = {"command": msg.data.strip()}
+
+        command = str(data.get("command", "")).upper()
+
+        if command == "STOP":
+            self.get_logger().warn("Mission STOP requested.")
+            self._publish_navigation_control("STOP")
+
+            self.mission_state = "idle"
+            self.fault_type = "missionCancelled"
+            self.waiting_for_valid = False
+            self.storage_done_for_current_target = False
+            self.active_order_id = ""
+            self.active_fruit = ""
+
+            self._set_traffic("O")
+            self._publish_mission_state()
+            self._publish_mission_event(
+                "missionCancelled",
+                "Mission stopped by GUI.",
+                0,
+            )
+            return
+
+        if command == "RESET":
+            self.get_logger().warn("Mission RESET requested.")
+            self.reset_obstacle_state()
+
+            self.mission_state = "idle"
+            self.fault_type = "none"
+            self.waiting_for_valid = False
+            self.storage_done_for_current_target = False
+            self.active_order_id = ""
+            self.active_fruit = ""
+
+            self._set_traffic("Y")
+            self._publish_mission_state()
+            self._publish_mission_event(
+                "missionReset",
+                "Mission state reset by GUI.",
+                0,
+            )
+            return
+
+        self.get_logger().warn(f"Unknown mission control command: {command}")
 
     def navigation_result_callback(self, msg: String):
         text = msg.data.strip()
@@ -272,6 +505,17 @@ class MissionNode(Node):
 
         if text.startswith("NAV_FAILED"):
             self._set_traffic("R")
+
+            if self.mission_state != "idle":
+                self.mission_state = "failed"
+                self.fault_type = "navigationFailed"
+                self._publish_mission_state()
+                self._publish_mission_event(
+                    "navigationFailed",
+                    "Navigation failed.",
+                    0,
+                )
+
             return
 
         if text.startswith("NAV_DONE"):
@@ -282,6 +526,15 @@ class MissionNode(Node):
             if abs(x) < 1e-6 and abs(y) < 1e-6:
                 self.get_logger().info("Reached HOME x=0 y=0. Storage sequence skipped.")
                 return
+
+            if self.mission_state == "headingToFruit":
+                self.mission_state = "visionChecking"
+                self._publish_mission_state()
+                self._publish_mission_event(
+                    "visionChecking",
+                    f"Reached {self.active_fruit}. Waiting for vision validation.",
+                    30,
+                )
 
             self.waiting_for_valid = True
             self.storage_done_for_current_target = False
@@ -294,6 +547,134 @@ class MissionNode(Node):
                     self.storage_done_for_current_target = True
                     self._start_storage_sequence_thread()
             return
+
+    def rfid_verification_callback(self, msg: String):
+        self.get_logger().info(f"RX /mission/rfid_verification: {msg.data}")
+
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.get_logger().warn("Invalid RFID JSON.")
+            return
+
+        success = bool(data.get("success", False))
+        rfid_card_id = data.get("rfid_card_id", "")
+
+        self.get_logger().info(
+            f"RFID result received: success={success}, card={rfid_card_id}"
+        )
+
+        self._publish_mission_event(
+            "rfidReceived",
+            f"RFID received: success={success}",
+            0,
+        )
+
+
+    def storage_close_request_callback(self, msg: String):
+        order_id = msg.data.strip()
+        self.get_logger().info(
+            f"RX /mission/storage_close_request: order_id={order_id}"
+        )
+
+        self._publish_mission_event(
+            "storageCloseRequested",
+            "Customer confirmed order collection.",
+            0,
+        )
+        
+    def order_request_callback(self, msg: String):
+        self.get_logger().info(f"RX /mission/order_request: {msg.data}")
+
+        if self.mission_state != "idle":
+            self.get_logger().warn(
+                f"Rejecting order because mission is active: state={self.mission_state}"
+            )
+            self._publish_mission_event(
+                "orderRejected",
+                f"Mission already active: {self.mission_state}",
+                0,
+            )
+            return
+
+        try:
+            order = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.get_logger().error("Invalid order JSON.")
+            self.fault_type = "badOrder"
+            self._publish_mission_event("orderRejected", "Invalid order JSON.", 0)
+            return
+
+        items = order.get("items", [])
+        if not items:
+            self.get_logger().error("Order has no items.")
+            self.fault_type = "badOrder"
+            self._publish_mission_event("orderRejected", "Order has no items.", 0)
+            return
+
+        if len(items) != 1:
+            self.get_logger().error("Stage 2 supports exactly one item only.")
+            self.fault_type = "unsupportedOrder"
+            self._publish_mission_event(
+                "orderRejected",
+                "Only one item is supported in this stage.",
+                0,
+            )
+            return
+
+        item = items[0]
+        quantity = int(item.get("quantity", 1))
+
+        if quantity != 1:
+            self.get_logger().error("Stage 2 supports quantity 1 only.")
+            self.fault_type = "unsupportedOrder"
+            self._publish_mission_event(
+                "orderRejected",
+                "Only quantity 1 is supported in this stage.",
+                0,
+            )
+            return
+
+        fruit_raw = item.get("product_name", item.get("name", "")).strip()
+        fruit = self._normalize_fruit_name(fruit_raw)
+
+        if fruit not in self.fruit_poses:
+            self.get_logger().error(f"Unknown fruit: {fruit_raw}")
+            self.fault_type = "unknownFruit"
+            self._publish_mission_event(
+                "orderRejected",
+                f"Unknown fruit: {fruit_raw}",
+                0,
+            )
+            return
+
+        self.active_order_id = order.get("order_id", order.get("id", ""))
+        self.active_user_id = order.get("user_id", "")
+        self.assigned_rfid = order.get("assigned_rfid", "")
+        self.active_fruit = fruit
+        self.fault_type = "none"
+
+        self.mission_state = "missionReceived"
+        self._publish_mission_state()
+        self._publish_mission_event(
+            "orderReceived",
+            f"Order received for {fruit}.",
+            5,
+        )
+
+        # Tell vision what fruit to validate.
+        self._publish_ordered_fruit(fruit)
+
+        # Send robot to fruit pose.
+        x, y, theta = self.fruit_poses[fruit]
+        self.mission_state = "headingToFruit"
+        self._publish_mission_state()
+        self._publish_mission_event(
+            "headingToFruit",
+            f"Heading to {fruit} stock position.",
+            15,
+        )
+        self._publish_navigation_goal(x, y, theta)
 
     def obstacle_callback(self, msg: Int32):
         self.latest_mask = msg.data
