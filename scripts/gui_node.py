@@ -71,6 +71,22 @@ class GuiNode(Node):
             .string_value
         )
 
+        # GUI heartbeat messages required by the PDF contract
+        self.robot_status_timer = self.create_timer(
+            2.0,
+            self.robot_status_heartbeat_callback,
+        )
+
+        self.system_health_timer = self.create_timer(
+            10.0,
+            self.system_health_timer_callback,
+        )
+
+        self.battery_timer = self.create_timer(
+            30.0,
+            self.battery_timer_callback,
+        )
+
         # ------------------------------------------------------------------
         # ROS publishers: GUI -> ROS semantic commands
         # ------------------------------------------------------------------
@@ -171,6 +187,13 @@ class GuiNode(Node):
             10,
         )
 
+        self.esp2_voltage_sub = self.create_subscription(
+            Float32,
+            "/esp2/voltage",
+            self.esp2_voltage_callback,
+            10,
+        )
+
         # ------------------------------------------------------------------
         # Cached ROS state for GUI messages
         # ------------------------------------------------------------------
@@ -187,6 +210,20 @@ class GuiNode(Node):
 
         self.last_drive_status_gui_time = 0.0
         self.drive_status_throttle_sec = 1.0
+
+        # Extra cached telemetry/state for PDF-compatible GUI messages
+        self.latest_battery_voltage = 11.4
+        self.latest_battery_percent = 82
+        self.latest_is_charging = False
+
+        self.latest_rfid_card_id = ""
+        self.latest_rfid_order_id = ""
+
+        self.start_time_monotonic = time.monotonic()
+        self.last_ros_message_time = time.monotonic()
+        self.last_drive_status_time = 0.0
+        self.last_vision_time = 0.0
+        self.last_obstacle_time = 0.0
 
         # ------------------------------------------------------------------
         # WebSocket threading
@@ -239,6 +276,16 @@ class GuiNode(Node):
                             "level": "system",
                             "event_type": "gui_node_connected",
                             "message": "ROS GUI bridge connected to dashboard WebSocket.",
+                            "timestamp": now_iso(),
+                        },
+                    )
+
+                    await self.send_dashboard_json_direct(
+                        ws,
+                        {
+                            "type": "connection.status",
+                            "state": "connected",
+                            "latency_ms": 0,
                             "timestamp": now_iso(),
                         },
                     )
@@ -413,6 +460,9 @@ class GuiNode(Node):
                 "timestamp": now_iso(),
             }
 
+            self.latest_rfid_card_id = rfid.get("rfid_card_id", "")
+            self.latest_rfid_order_id = rfid.get("order_id", "")
+
             self.publish_string(
                 self.rfid_verification_pub,
                 compact_json(rfid),
@@ -481,6 +531,193 @@ class GuiNode(Node):
     # ROS -> Dashboard WS
     # ======================================================================
 
+    def _battery_percent_from_voltage(self, voltage: float) -> int:
+        """
+        Simple linear estimate:
+        9.0 V  -> 0%
+        12.0 V -> 100%
+
+        This is only GUI telemetry estimation, not BMS logic.
+        """
+
+        percent = int(round(((voltage - 9.0) / (12.0 - 9.0)) * 100.0))
+        return max(0, min(100, percent))
+
+
+    def _send_robot_status(self):
+        self.send_dashboard_json(
+            {
+                "type": "robot.status",
+                "battery_percent": int(self.latest_battery_percent),
+                "is_charging": bool(self.latest_is_charging),
+                "mode": "autonomous",
+                "mission_state": self.latest_mission_state,
+                "storage_state": self.latest_storage_state,
+                "fault_type": self.latest_fault_type,
+                "active_order_id": self.latest_active_order_id,
+                "linear_speed": 0.0,
+                "angular_speed": 0.0,
+                "distance_remaining": float(self.latest_distance_remaining),
+                "obstacle_detected": bool(self.latest_obstacle_detected),
+                "current_fruit": self.latest_current_fruit.lower() if self.latest_current_fruit else "",
+                "timestamp": now_iso(),
+            }
+        )
+
+
+    def _send_order_status_update(self, order_id: str, event: str, message: str):
+        if not order_id:
+            return
+
+        status_map = {
+            "orderReceived": "accepted",
+            "missionReceived": "accepted",
+            "headingToFruit": "navigating_to_fruit",
+            "visionChecking": "checking_stock",
+            "storing": "collecting_fruit",
+            "headingToCustomer": "delivering",
+            "rfidAwaiting": "waiting_for_rfid",
+            "storageOpened": "ready_for_pickup",
+            "storageClosed": "collected",
+            "returning": "returning",
+            "idle": "completed",
+            "error": "failed",
+            "failed": "failed",
+        }
+
+        self.send_dashboard_json(
+            {
+                "type": "order.status_update",
+                "order_id": order_id,
+                "status": status_map.get(event, event),
+                "message": message,
+                "timestamp": now_iso(),
+            }
+        )
+
+
+    def _send_storage_messages_for_event(self, order_id: str, event: str):
+        if not order_id:
+            return
+
+        if event == "storing":
+            self.send_dashboard_json(
+                {
+                    "type": "storage.pickup_status",
+                    "state": "gripping",
+                    "fruit": self.latest_current_fruit.lower() if self.latest_current_fruit else "",
+                    "attempt": 1,
+                    "timestamp": now_iso(),
+                }
+            )
+
+            self.send_dashboard_json(
+                {
+                    "type": "storage.status",
+                    "state": "opening",
+                    "order_id": order_id,
+                    "timestamp": now_iso(),
+                }
+            )
+            return
+
+        if event == "storageOpened":
+            self.send_dashboard_json(
+                {
+                    "type": "storage.status",
+                    "state": "open",
+                    "order_id": order_id,
+                    "timestamp": now_iso(),
+                }
+            )
+
+            self.send_dashboard_json(
+                {
+                    "type": "storage.open",
+                    "state": "open",
+                    "order_id": order_id,
+                    "timestamp": now_iso(),
+                }
+            )
+            return
+
+        if event == "storageClosed":
+            self.send_dashboard_json(
+                {
+                    "type": "storage.status",
+                    "state": "closed",
+                    "order_id": order_id,
+                    "timestamp": now_iso(),
+                }
+            )
+
+            self.send_dashboard_json(
+                {
+                    "type": "storage.closed",
+                    "state": "closing",
+                    "order_id": order_id,
+                    "timestamp": now_iso(),
+                }
+            )
+            return
+
+
+    def _send_rfid_result_for_event(self, order_id: str, event: str, message: str):
+        if event == "storageOpened":
+            self.send_dashboard_json(
+                {
+                    "type": "rfid.result",
+                    "success": True,
+                    "rfid_card_id": self.latest_rfid_card_id,
+                    "order_id": order_id,
+                    "message": "Identity verified ✓",
+                    "timestamp": now_iso(),
+                }
+            )
+            return
+
+        if event in ("error", "failed") and self.latest_fault_type == "rfidFailed":
+            self.send_dashboard_json(
+                {
+                    "type": "rfid.result",
+                    "success": False,
+                    "rfid_card_id": self.latest_rfid_card_id,
+                    "order_id": order_id,
+                    "message": message or "RFID verification failed.",
+                    "timestamp": now_iso(),
+                }
+            )
+            return
+
+
+    def _send_battery_telemetry(self):
+        self.send_dashboard_json(
+            {
+                "type": "telemetry.battery",
+                "battery_percent": int(self.latest_battery_percent),
+                "is_charging": bool(self.latest_is_charging),
+                "voltage": round(float(self.latest_battery_voltage), 2),
+                "estimated_minutes_remaining": int(max(0, self.latest_battery_percent * 2)),
+                "timestamp": now_iso(),
+            }
+        )
+
+
+    def _send_system_health(self):
+        now = time.monotonic()
+
+        self.send_dashboard_json(
+            {
+                "type": "system.health",
+                "level": "nominal",
+                "uptime_seconds": int(now - self.start_time_monotonic),
+                "ros2_active": True,
+                "micro_ros_active": (now - self.last_drive_status_time) < 5.0 if self.last_drive_status_time else False,
+                "camera_active": (now - self.last_vision_time) < 5.0 if self.last_vision_time else False,
+                "lidar_active": (now - self.last_obstacle_time) < 5.0 if self.last_obstacle_time else False,
+                "timestamp": now_iso(),
+            }
+        )
     def mission_state_callback(self, msg: String):
             """
             Convert ROS /mission/state JSON into GUI robot.status JSON.
@@ -514,24 +751,8 @@ class GuiNode(Node):
 
             self.latest_storage_state = storage_state
 
-            self.send_dashboard_json(
-                {
-                    "type": "robot.status",
-                    "battery_percent": 82,
-                    "is_charging": False,
-                    "mode": "autonomous",
-                    "mission_state": mission_state,
-                    "storage_state": storage_state,
-                    "fault_type": fault_type,
-                    "active_order_id": order_id,
-                    "linear_speed": 0.0,
-                    "angular_speed": 0.0,
-                    "distance_remaining": float(self.latest_distance_remaining),
-                    "obstacle_detected": bool(self.latest_obstacle_detected),
-                    "current_fruit": fruit.lower() if fruit else "",
-                    "timestamp": now_iso(),
-                }
-            )
+            self.last_ros_message_time = time.monotonic()
+            self._send_robot_status()   
 
 
     def mission_event_callback(self, msg: String):
@@ -574,45 +795,54 @@ class GuiNode(Node):
                 }
             )
 
+            self.last_ros_message_time = time.monotonic()
+
+            # Extra PDF-required messages generated from mission events
+            self._send_order_status_update(order_id, event, message)
+            self._send_storage_messages_for_event(order_id, event)
+            self._send_rfid_result_for_event(order_id, event, message)
+
 
     def navigation_status_callback(self, msg: String):
-            """
-            Convert ROS /navigation/status JSON into GUI navigation.path_status JSON.
-            """
+        """
+        Convert ROS /navigation/status JSON into GUI navigation.path_status JSON.
+        """
 
-            try:
-                data = json.loads(msg.data)
-            except json.JSONDecodeError:
-                self.get_logger().warn(f"Invalid /navigation/status JSON: {msg.data}")
-                return
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.get_logger().warn(f"Invalid /navigation/status JSON: {msg.data}")
+            return
 
-            status = data.get("status", "")
-            goal = data.get("goal", {}) or {}
+        status = data.get("status", "")
+        goal = data.get("goal", {}) or {}
 
-            state = "clear"
-            if status in ("FAILED", "STOPPED"):
-                state = "blocked"
+        state = "clear"
+        if status in ("FAILED", "STOPPED"):
+            state = "blocked"
 
-            target_x = float(goal.get("x", 0.0))
-            target_y = float(goal.get("y", 0.0))
+        target_x = float(goal.get("x", 0.0))
+        target_y = float(goal.get("y", 0.0))
 
-            self.send_dashboard_json(
-                {
-                    "type": "navigation.path_status",
-                    "state": state,
-                    "target_x": target_x,
-                    "target_y": target_y,
-                    "distance_to_goal": float(self.latest_distance_remaining),
-                    "estimated_seconds": 0,
-                    "timestamp": now_iso(),
-                }
-            )
+        self.last_ros_message_time = time.monotonic()
 
+        self.send_dashboard_json(
+            {
+                "type": "navigation.path_status",
+                "state": state,
+                "target_x": target_x,
+                "target_y": target_y,
+                "distance_to_goal": float(self.latest_distance_remaining),
+                "estimated_seconds": 0,
+                "timestamp": now_iso(),
+            }
+        )
 
     def navigation_pose_callback(self, msg: Pose2D):
             """
             Convert ROS /navigation/pose into GUI navigation.pose JSON.
             """
+            self.last_ros_message_time = time.monotonic()
 
             self.send_dashboard_json(
                 {
@@ -637,7 +867,18 @@ class GuiNode(Node):
             }
         )
 
+    def esp2_voltage_callback(self, msg: Float32):
+        voltage = float(msg.data)
+
+        self.latest_battery_voltage = voltage
+        self.latest_battery_percent = self._battery_percent_from_voltage(voltage)
+        self.last_ros_message_time = time.monotonic()
+
+        self._send_battery_telemetry()
+
     def drive_status_callback(self, msg: String):
+        self.last_ros_message_time = time.monotonic()
+        self.last_drive_status_time = time.monotonic()
         text = msg.data.strip()
 
         # STATUS can be high-rate. Throttle it.
@@ -658,6 +899,9 @@ class GuiNode(Node):
         )
 
     def obstacle_status_callback(self, msg: Int32):
+
+        self.last_ros_message_time = time.monotonic()
+        self.last_obstacle_time = time.monotonic()
         mask = int(msg.data)
         blocking = mask != 0
         self.latest_obstacle_detected = blocking
@@ -675,14 +919,20 @@ class GuiNode(Node):
         )
 
     def detected_fruit_callback(self, msg: String):
+        self.last_ros_message_time = time.monotonic()
+        self.last_vision_time = time.monotonic()
         self.latest_detected_fruit = msg.data.strip()
         self.publish_cached_vision_to_gui()
 
     def detected_confidence_callback(self, msg: Float32):
+        self.last_ros_message_time = time.monotonic()
+        self.last_vision_time = time.monotonic()
         self.latest_detected_confidence = float(msg.data)
         self.publish_cached_vision_to_gui()
 
     def valid_callback(self, msg: Bool):
+        self.last_ros_message_time = time.monotonic()
+        self.last_vision_time = time.monotonic()
         self.latest_valid = bool(msg.data)
         self.publish_cached_vision_to_gui()
 
@@ -702,6 +952,17 @@ class GuiNode(Node):
                 "timestamp": now_iso(),
             }
         )
+
+    def robot_status_heartbeat_callback(self):
+        self._send_robot_status()
+
+
+    def system_health_timer_callback(self):
+        self._send_system_health()
+
+
+    def battery_timer_callback(self):
+        self._send_battery_telemetry()
 
     # ======================================================================
     # Shutdown

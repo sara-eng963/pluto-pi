@@ -98,6 +98,32 @@
   .filter-chip.active { background: var(--primary); color: #fff; border-color: var(--primary); }
   #log-clear { margin-left: auto; padding: 3px 9px; border-radius: 20px; font-size: 11px; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--muted); }
 
+  #copy-in-all {
+  padding: 3px 9px;
+  border-radius: 20px;
+  font-size: 11px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted);
+}
+
+.copy-msg-btn {
+  float: right;
+  padding: 2px 7px;
+  border-radius: 5px;
+  font-size: 10px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.copy-msg-btn:hover,
+#copy-in-all:hover {
+  color: var(--text);
+  border-color: var(--primary);
+}
   /* Toast */
   #toast { position: fixed; bottom: 20px; right: 20px; background: var(--card); border: 1px solid var(--border); padding: 10px 16px; border-radius: 8px; font-size: 12px; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 100; }
   #toast.show { opacity: 1; }
@@ -238,7 +264,8 @@
       <span class="filter-chip"       onclick="setFilter('OUT',this)">OUT</span>
       <span class="filter-chip"       onclick="setFilter('IN',this)">IN</span>
       <span class="filter-chip"       onclick="setFilter('SYS',this)">SYS</span>
-      <button id="log-clear" onclick="clearLog()">Clear</button>
+      <button id="copy-in-all" onclick="copyAllInMessages()">Copy IN</button>
+<button id="log-clear" onclick="clearLog()">Clear</button>
     </div>
     <div class="panel-title">Message Log</div>
     <div class="panel-body" id="log-container">
@@ -383,13 +410,56 @@ function makeLogEl(entry) {
   const src  = entry.src ? ` [${entry.src}]` : '';
   const type = entry.msg?.type || entry.msg?.info || '';
   const body = JSON.stringify(entry.msg, null, 2);
-  const short = body;
+
+  const copyBtn = dir === 'IN'
+    ? `<button class="copy-msg-btn" onclick='copyOneMessage(${JSON.stringify(body)})'>Copy</button>`
+    : '';
+
   div.innerHTML = `
-    <div class="log-ts">${ts}${src}</div>
+    <div class="log-ts">${ts}${src}${copyBtn}</div>
     <div><span class="log-dir dir-${dir}">${dir}</span><b style="color:var(--info)">${type}</b></div>
-    <div class="log-body">${escHtml(short)}</div>
+    <div class="log-body">${escHtml(body)}</div>
   `;
   return div;
+}
+
+function clearLog() {
+  allLogEntries = [];
+  document.getElementById('log-list').innerHTML = '';
+}
+
+async function copyTextToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Copied', 'success');
+  } catch (e) {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand('copy');
+    document.body.removeChild(textarea);
+    toast('Copied', 'success');
+  }
+}
+
+function copyOneMessage(text) {
+  copyTextToClipboard(text);
+}
+
+function copyAllInMessages() {
+  const inMessages = allLogEntries
+    .filter(e => e.dir === 'IN')
+    .map(e => JSON.stringify(e.msg, null, 2));
+
+  if (inMessages.length === 0) {
+    toast('No IN messages to copy', 'error');
+    return;
+  }
+
+  copyTextToClipboard(inMessages.join('\n\n---\n\n'));
 }
 
 function escHtml(s) {
