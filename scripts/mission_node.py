@@ -592,7 +592,9 @@ class MissionNode(Node):
         if text.startswith("NAV_FAILED"):
             self._set_traffic("R")
 
-            if self.mission_state != "idle":
+            # Only navigation states are allowed to fail the mission.
+            # Ignore stale NAV_FAILED after robot already reached customer / opened storage.
+            if self.mission_state in ["headingToFruit", "headingToCustomer"]:
                 self.mission_state = "failed"
                 self.fault_type = "navigationFailed"
                 self._publish_mission_state()
@@ -600,6 +602,10 @@ class MissionNode(Node):
                     "error",
                     "Navigation failed.",
                     0,
+                )
+            else:
+                self.get_logger().warn(
+                    f"Ignoring NAV_FAILED because mission_state={self.mission_state}"
                 )
 
             return
