@@ -63,6 +63,18 @@ class MissionNode(Node):
         self.assigned_rfid = ""
         self.fault_type = "none"
 
+        self.storage_sequence_running = False
+        self.latest_valid = False
+        self.waiting_for_valid = False
+        self.storage_done_for_current_target = False
+
+        self.waiting_for_rfid = False
+        self.rfid_verified = False
+        self.waiting_for_storage_close = False
+
+        # Customer pose is HOME for this project
+        self.customer_pose = (0.0, 0.0, 0.0)
+
         # Temporary hardcoded fruit poses for Stage 2
         # Later move these to YAML parameters.
         self.fruit_poses = {
@@ -178,10 +190,6 @@ class MissionNode(Node):
         )
 
         self.current_traffic = None
-        self.storage_sequence_running = False
-        self.latest_valid = False
-        self.waiting_for_valid = False
-        self.storage_done_for_current_target = False
 
         self.get_logger().info("Mission node started.")
         self.get_logger().info("Obstacle logic active.")
@@ -242,6 +250,10 @@ class MissionNode(Node):
             },
             "/mission/event",
         )
+    def _set_mission_state(self, state: str, event: str, message: str, progress: int):
+        self.mission_state = state
+        self._publish_mission_state()
+        self._publish_mission_event(event, message, progress)
 
 
     def _publish_ordered_fruit(self, fruit: str):
@@ -338,6 +350,46 @@ class MissionNode(Node):
 
         return x, y, yaw
 
+    def _open_storage_for_customer(self):
+        self.get_logger().info("Opening storage for customer.")
+
+        self._send_gripper_cmd("open_lock")
+        time.sleep(1.0)
+
+        self._send_gripper_cmd("open_lid")
+        time.sleep(1.0)
+
+        self.get_logger().info("Storage opened for customer.")
+
+
+    def _start_open_storage_thread(self):
+        threading.Thread(
+            target=self._open_storage_for_customer,
+            daemon=True,
+        ).start()
+
+
+    def _close_storage_after_customer(self):
+        self.get_logger().info("Closing storage after customer collection.")
+
+        self._send_gripper_cmd("close_lid")
+        time.sleep(1.0)
+
+        self._send_gripper_cmd("close_lock")
+        time.sleep(1.0)
+
+        self.get_logger().info("Storage closed after customer collection.")
+
+        # Customer pose is HOME, so after closing storage the mission is complete.
+        self._finish_mission_to_idle()
+
+
+    def _start_close_storage_thread(self):
+        threading.Thread(
+            target=self._close_storage_after_customer,
+            daemon=True,
+        ).start()
+        
     def run_storage_sequence(self):
         if self.storage_sequence_running:
             self.get_logger().warn("Storage sequence already running. Ignoring duplicate request.")
@@ -374,29 +426,53 @@ class MissionNode(Node):
         time.sleep(1.0)
 
         self.storage_sequence_running = False
-        self.get_logger().info("Storage sequence complete.")
+        self.get_logger().info("Fruit pickup storage sequence complete.")
+
         if self.mission_state == "storing":
             self._publish_mission_event(
-                "storageComplete",
-                "Storage sequence complete. Stage 2 mission finished.",
-                100,
+                "storing",
+                "Fruit collected and placed in storage.",
+                50,
             )
 
-            self.mission_state = "idle"
-            self.active_order_id = ""
-            self.active_fruit = ""
-            self.active_user_id = ""
-            self.assigned_rfid = ""
-            self.fault_type = "none"
-            self.waiting_for_valid = False
-            self.storage_done_for_current_target = False
-            self._publish_mission_state()
+            # Customer pose is HOME: x=0, y=0, yaw=0
+            self._set_mission_state(
+                "headingToCustomer",
+                "headingToCustomer",
+                "Robot heading to customer location.",
+                55,
+            )
+
+            x, y, theta = self.customer_pose
+            self._publish_navigation_goal(x, y, theta)
 
     def _start_storage_sequence_thread(self):
         threading.Thread(
             target=self.run_storage_sequence,
             daemon=True,
         ).start()
+
+    def _finish_mission_to_idle(self):
+        self._publish_mission_event(
+            "idle",
+            "Mission complete. Robot is idle.",
+            100,
+        )
+
+        self.mission_state = "idle"
+        self.active_order_id = ""
+        self.active_fruit = ""
+        self.active_user_id = ""
+        self.assigned_rfid = ""
+        self.fault_type = "none"
+
+        self.waiting_for_valid = False
+        self.storage_done_for_current_target = False
+        self.waiting_for_rfid = False
+        self.rfid_verified = False
+        self.waiting_for_storage_close = False
+
+        self._publish_mission_state()
 
     def _normalize_fruit_name(self, name: str) -> str:
         n = name.strip().lower()
@@ -457,8 +533,13 @@ class MissionNode(Node):
             self.fault_type = "missionCancelled"
             self.waiting_for_valid = False
             self.storage_done_for_current_target = False
+            self.waiting_for_rfid = False
+            self.rfid_verified = False
+            self.waiting_for_storage_close = False
             self.active_order_id = ""
             self.active_fruit = ""
+            self.active_user_id = ""
+            self.assigned_rfid = ""
 
             self._set_traffic("O")
             self._publish_mission_state()
@@ -477,7 +558,12 @@ class MissionNode(Node):
             self.fault_type = "none"
             self.waiting_for_valid = False
             self.storage_done_for_current_target = False
+            self.waiting_for_rfid = False
+            self.rfid_verified = False
+            self.waiting_for_storage_close = False
             self.active_order_id = ""
+            self.active_user_id = ""
+            self.assigned_rfid = ""
             self.active_fruit = ""
 
             self._set_traffic("Y")
@@ -511,34 +597,32 @@ class MissionNode(Node):
                 self.fault_type = "navigationFailed"
                 self._publish_mission_state()
                 self._publish_mission_event(
-                    "navigationFailed",
+                    "error",
                     "Navigation failed.",
                     0,
                 )
 
             return
 
-        if text.startswith("NAV_DONE"):
-            self._set_traffic("G")
+        if not text.startswith("NAV_DONE"):
+            return
 
-            x, y, yaw = self._parse_navigation_result_pose(text)
+        self._set_traffic("G")
+        x, y, yaw = self._parse_navigation_result_pose(text)
 
-            if abs(x) < 1e-6 and abs(y) < 1e-6:
-                self.get_logger().info("Reached HOME x=0 y=0. Storage sequence skipped.")
-                return
-
-            if self.mission_state == "headingToFruit":
-                self.mission_state = "visionChecking"
-                self._publish_mission_state()
-                self._publish_mission_event(
-                    "visionChecking",
-                    f"Reached {self.active_fruit}. Waiting for vision validation.",
-                    30,
-                )
+        # Case 1: robot reached fruit stock area
+        if self.mission_state == "headingToFruit":
+            self.mission_state = "visionChecking"
+            self._publish_mission_state()
+            self._publish_mission_event(
+                "visionChecking",
+                f"Reached {self.active_fruit}. Waiting for vision validation.",
+                30,
+            )
 
             self.waiting_for_valid = True
             self.storage_done_for_current_target = False
-            self.get_logger().info("Reached target. Waiting for /valid = true before storage sequence.")
+            self.get_logger().info("Reached fruit target. Waiting for /valid = true.")
 
             if self.latest_valid:
                 if (not self.storage_sequence_running) and (not self.storage_done_for_current_target):
@@ -546,7 +630,26 @@ class MissionNode(Node):
                     self.waiting_for_valid = False
                     self.storage_done_for_current_target = True
                     self._start_storage_sequence_thread()
+
             return
+
+        # Case 2: robot reached customer pose, which is HOME = 0,0,0
+        if self.mission_state == "headingToCustomer":
+            self.waiting_for_rfid = True
+            self.rfid_verified = False
+
+            self._set_mission_state(
+                "rfidAwaiting",
+                "rfidAwaiting",
+                "Robot reached customer. Waiting for RFID verification.",
+                70,
+            )
+            return
+
+        # Any other NAV_DONE is ignored safely
+        self.get_logger().info(
+            f"NAV_DONE ignored for mission_state={self.mission_state}, pose=({x:.3f},{y:.3f},{yaw:.1f})"
+        )
 
     def rfid_verification_callback(self, msg: String):
         self.get_logger().info(f"RX /mission/rfid_verification: {msg.data}")
@@ -557,18 +660,54 @@ class MissionNode(Node):
             self.get_logger().warn("Invalid RFID JSON.")
             return
 
+        if self.mission_state != "rfidAwaiting":
+            self.get_logger().warn(
+                f"Ignoring RFID because mission_state={self.mission_state}, not rfidAwaiting."
+            )
+            return
+
+        order_id = data.get("order_id", "")
         success = bool(data.get("success", False))
         rfid_card_id = data.get("rfid_card_id", "")
 
-        self.get_logger().info(
-            f"RFID result received: success={success}, card={rfid_card_id}"
+        if order_id and order_id != self.active_order_id:
+            self.get_logger().warn(
+                f"RFID order mismatch: received={order_id}, active={self.active_order_id}"
+            )
+            return
+
+        if (not success) or (rfid_card_id != self.assigned_rfid):
+            self.get_logger().error(
+                f"RFID failed: success={success}, card={rfid_card_id}, expected={self.assigned_rfid}"
+            )
+
+            self.waiting_for_rfid = False
+            self.rfid_verified = False
+            self.mission_state = "failed"
+            self.fault_type = "rfidFailed"
+
+            self._publish_mission_state()
+            self._publish_mission_event(
+                "error",
+                "RFID verification failed.",
+                0,
+            )
+            return
+
+        self.get_logger().info("RFID verification passed.")
+
+        self.waiting_for_rfid = False
+        self.rfid_verified = True
+        self.waiting_for_storage_close = True
+
+        self._set_mission_state(
+            "storageOpened",
+            "storageOpened",
+            "RFID verified. Storage opened for customer.",
+            80,
         )
 
-        self._publish_mission_event(
-            "rfidReceived",
-            f"RFID received: success={success}",
-            0,
-        )
+        self._start_open_storage_thread()
 
 
     def storage_close_request_callback(self, msg: String):
@@ -577,12 +716,29 @@ class MissionNode(Node):
             f"RX /mission/storage_close_request: order_id={order_id}"
         )
 
-        self._publish_mission_event(
-            "storageCloseRequested",
-            "Customer confirmed order collection.",
-            0,
+        if self.mission_state != "storageOpened":
+            self.get_logger().warn(
+                f"Ignoring storage close request because mission_state={self.mission_state}, not storageOpened."
+            )
+            return
+
+        if order_id and order_id != self.active_order_id:
+            self.get_logger().warn(
+                f"Storage close order mismatch: received={order_id}, active={self.active_order_id}"
+            )
+            return
+
+        self.waiting_for_storage_close = False
+
+        self._set_mission_state(
+            "storageClosed",
+            "storageClosed",
+            "Customer confirmed collection. Closing storage.",
+            90,
         )
-        
+
+        self._start_close_storage_thread()
+
     def order_request_callback(self, msg: String):
         self.get_logger().info(f"RX /mission/order_request: {msg.data}")
 
