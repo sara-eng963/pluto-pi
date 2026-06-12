@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pluto Robot Sim Dashboard</title>
+<style>
+  :root {
+    --bg:       #0d0f14;
+    --surface:  #161922;
+    --card:     #1e2230;
+    --border:   #2a2f3e;
+    --primary:  #4f8ef7;
+    --success:  #34c77b;
+    --warning:  #f5a623;
+    --danger:   #f05c5c;
+    --info:     #6ec6f5;
+    --text:     #e2e8f4;
+    --muted:    #6b7494;
+    --accent:   #7c5cfc;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; font-size: 13px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ── Top Bar ── */
+  #topbar { background: var(--surface); border-bottom: 1px solid var(--border); padding: 10px 18px; display: flex; align-items: center; gap: 16px; flex-shrink: 0; }
+  #topbar h1 { font-size: 15px; font-weight: 600; letter-spacing: .5px; color: var(--primary); flex: 1; }
+  .badge { padding: 3px 9px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge.connected    { background: #1a3a28; color: var(--success); border: 1px solid var(--success); }
+  .badge.disconnected { background: #3a1a1a; color: var(--danger);  border: 1px solid var(--danger); }
+  #flutter-count { color: var(--muted); font-size: 12px; }
+
+  /* ── Main Layout ── */
+  #main { display: grid; grid-template-columns: 260px 1fr 340px; gap: 0; flex: 1; min-height: 0; }
+
+  /* ── Panels ── */
+  .panel { border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+  .panel:last-child { border-right: none; }
+  .panel-title { padding: 10px 14px; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--muted); background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .panel-body { padding: 12px; overflow-y: auto; flex: 1; }
+
+  /* ── Robot State Panel ── */
+  .state-row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .state-row:last-child { border-bottom: none; }
+  .state-label { color: var(--muted); font-size: 11px; }
+  .state-value { font-weight: 600; font-size: 12px; }
+  .state-value.ok       { color: var(--success); }
+  .state-value.warn     { color: var(--warning); }
+  .state-value.danger   { color: var(--danger);  }
+  .state-value.primary  { color: var(--primary); }
+  .state-value.accent   { color: var(--accent);  }
+
+  /* Battery Bar */
+  #battery-bar-wrap { margin: 8px 0; }
+  #battery-bar-bg { background: var(--border); border-radius: 4px; height: 8px; overflow: hidden; }
+  #battery-bar { height: 100%; border-radius: 4px; transition: width 0.5s, background 0.5s; }
+
+  /* Mission State Chip */
+  #mission-chip { display: inline-block; padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700; margin-top: 6px; }
+
+  /* ── Controls Panel ── */
+  .ctrl-section { margin-bottom: 14px; }
+  .ctrl-section-title { font-size: 10px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; color: var(--muted); margin-bottom: 7px; padding-bottom: 4px; border-bottom: 1px solid var(--border); }
+  .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .btn { padding: 8px 10px; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: opacity 0.15s, transform 0.1s; text-align: center; }
+  .btn:hover  { opacity: .85; }
+  .btn:active { transform: scale(.97); }
+  .btn.full   { grid-column: 1 / -1; }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-success { background: var(--success); color: #fff; }
+  .btn-warning { background: var(--warning); color: #000; }
+  .btn-danger  { background: var(--danger);  color: #fff; }
+  .btn-accent  { background: var(--accent);  color: #fff; }
+  .btn-muted   { background: var(--card);    color: var(--text); border: 1px solid var(--border); }
+
+  /* Force state select */
+  .force-row { display: flex; gap: 6px; margin-top: 4px; }
+  select { flex: 1; background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+
+  /* ── Log Panel ── */
+  #log-list { display: flex; flex-direction: column; gap: 4px; }
+  .log-entry { padding: 6px 8px; border-radius: 5px; border: 1px solid var(--border); font-size: 11px; word-break: break-all; }
+  .log-entry .log-ts  { color: var(--muted); font-size: 10px; margin-bottom: 2px; }
+  .log-entry .log-dir { font-weight: 700; font-size: 10px; margin-right: 5px; padding: 1px 5px; border-radius: 3px; }
+  .log-entry .log-body { font-family: 'Cascadia Code', 'Consolas', monospace; color: #c9d1e8; }
+  .dir-OUT  { background: #1a2f4a; color: var(--primary); }
+  .dir-IN   { background: #1a3a28; color: var(--success); }
+  .dir-SYS  { background: #2a2230; color: var(--accent);  }
+
+  /* Log filter */
+  #log-filter { display: flex; gap: 6px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .filter-chip { padding: 3px 9px; border-radius: 20px; font-size: 11px; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--muted); }
+  .filter-chip.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+  #log-clear { margin-left: auto; padding: 3px 9px; border-radius: 20px; font-size: 11px; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--muted); }
+
+  /* Toast */
+  #toast { position: fixed; bottom: 20px; right: 20px; background: var(--card); border: 1px solid var(--border); padding: 10px 16px; border-radius: 8px; font-size: 12px; opacity: 0; transition: opacity .3s; pointer-events: none; z-index: 100; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<!-- ── Top Bar ── -->
+<div id="topbar">
+  <h1>🤖 Pluto Robot Sim Dashboard</h1>
+  <span id="flutter-count">Flutter clients: 0</span>
+  <span id="ws-badge" class="badge disconnected">● Disconnected</span>
+</div>
+
+<!-- ── Main ── -->
+<div id="main">
+
+  <!-- ── LEFT: Robot State ── -->
+  <div class="panel">
+    <div class="panel-title">Robot State</div>
+    <div class="panel-body">
+      <div id="battery-bar-wrap">
+        <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+          <span class="state-label">Battery</span>
+          <span id="bat-txt" class="state-value ok">82%</span>
+        </div>
+        <div id="battery-bar-bg"><div id="battery-bar" style="width:82%;background:var(--success)"></div></div>
+      </div>
+
+      <div id="mission-chip" style="background:#1a2f4a;color:var(--primary)">idle</div>
+      <div style="margin-top:10px;">
+        <div class="state-row"><span class="state-label">Mode</span>           <span class="state-value primary" id="s-mode">autonomous</span></div>
+        <div class="state-row"><span class="state-label">Storage</span>        <span class="state-value ok"      id="s-storage">closed</span></div>
+        <div class="state-row"><span class="state-label">Fault</span>          <span class="state-value ok"      id="s-fault">none</span></div>
+        <div class="state-row"><span class="state-label">Active Order</span>   <span class="state-value accent"  id="s-order">—</span></div>
+        <div class="state-row"><span class="state-label">Fruit</span>          <span class="state-value accent"  id="s-fruit">—</span></div>
+        <div class="state-row"><span class="state-label">Distance</span>       <span class="state-value primary" id="s-dist">0.00 m</span></div>
+        <div class="state-row"><span class="state-label">Speed</span>          <span class="state-value primary" id="s-speed">0.00 m/s</span></div>
+        <div class="state-row"><span class="state-label">Obstacle</span>       <span class="state-value ok"      id="s-obs">Clear</span></div>
+        <div class="state-row"><span class="state-label">Paused</span>         <span class="state-value ok"      id="s-paused">No</span></div>
+        <div class="state-row"><span class="state-label">Flutter Clients</span><span class="state-value"         id="s-clients">0</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── CENTRE: Controls ── -->
+  <div class="panel">
+    <div class="panel-title">Mission Controls</div>
+    <div class="panel-body">
+
+      <!-- Mission -->
+      <div class="ctrl-section">
+        <div class="ctrl-section-title">Mission</div>
+        <div class="btn-grid">
+          <button class="btn btn-danger full" onclick="send({type:'mission.stop',order_id:currentOrderId,reason:'dashboard'})">⏹ Stop Mission</button>
+          <button class="btn btn-muted full"  onclick="send({type:'debug.reset'})">🔄 Full Reset</button>
+        </div>
+      </div>
+
+      <!-- Obstacle -->
+      <div class="ctrl-section">
+        <div class="ctrl-section-title">Obstacle</div>
+        <div class="btn-grid">
+          <button class="btn btn-danger"   onclick="send({type:'debug.obstacle_inject',distance_meters:0.4,angle_degrees:0})">🚧 Inject</button>
+          <button class="btn btn-success"  onclick="send({type:'debug.obstacle_release'})">✅ Release</button>
+        </div>
+      </div>
+
+      <!-- RFID -->
+      <div class="ctrl-section">
+        <div class="ctrl-section-title">RFID Simulation</div>
+        <div class="btn-grid">
+          <button class="btn btn-success" onclick="simRfid(true)">✓ RFID Pass</button>
+          <button class="btn btn-danger"  onclick="simRfid(false)">✗ RFID Fail</button>
+        </div>
+        <div style="margin-top:6px;">
+          <input id="rfid-input" placeholder="RFID card ID (optional)" style="width:100%;background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;font-size:12px;" value="RFID_A1B2C3" />
+        </div>
+      </div>
+
+      <!-- Battery -->
+      <div class="ctrl-section">
+        <div class="ctrl-section-title">Battery</div>
+        <div class="btn-grid">
+          <button class="btn btn-warning" onclick="send({type:'debug.battery_drain',amount:20})">🔋 -20%</button>
+          <button class="btn btn-warning" onclick="send({type:'debug.battery_drain',amount:5})">🔋 -5%</button>
+          <button class="btn btn-success" onclick="send({type:'debug.battery_charge',amount:30})">⚡ +30%</button>
+          <button class="btn btn-success" onclick="send({type:'debug.battery_charge',amount:100})">⚡ Full</button>
+        </div>
+      </div>
+
+      <!-- Force State -->
+      <div class="ctrl-section">
+        <div class="ctrl-section-title">Force Mission State</div>
+        <div class="force-row">
+          <select id="force-state-sel">
+            <option value="idle">idle</option>
+            <option value="missionReceived">missionReceived</option>
+            <option value="headingToFruit">headingToFruit</option>
+            <option value="visionChecking">visionChecking</option>
+            <option value="storing">storing</option>
+            <option value="headingToCustomer">headingToCustomer</option>
+            <option value="rfidAwaiting">rfidAwaiting</option>
+            <option value="storageOpened">storageOpened</option>
+            <option value="storageClosed">storageClosed</option>
+            <option value="returning">returning</option>
+            <option value="failed">failed</option>
+          </select>
+          <button class="btn btn-accent" onclick="forceState()">Force</button>
+        </div>
+      </div>
+
+      <!-- Storage -->
+      <div class="ctrl-section">
+        <div class="ctrl-section-title">Storage Door</div>
+        <div class="btn-grid">
+          <button class="btn btn-primary" onclick="apiPost('/robot/storage/open',{})">📂 Open</button>
+          <button class="btn btn-muted"   onclick="apiPost('/robot/storage/close',{})">📁 Close</button>
+          <button class="btn btn-accent full" onclick="sendStorageCloseRequest()" style="margin-top:6px">✅ "I Took My Order" (storage.close_request)</button>
+        </div>
+      </div>
+
+      <!-- Manual order via WS -->
+      <div class="ctrl-section">
+        <div class="ctrl-section-title">Quick Test Order (WS)</div>
+        <div class="btn-grid">
+          <button class="btn btn-accent full" onclick="sendTestOrder()">🛒 Place Test Order (Apple × 1)</button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── RIGHT: Message Log ── -->
+  <div class="panel">
+    <div id="log-filter">
+      <span class="filter-chip active" onclick="setFilter('ALL',this)">ALL</span>
+      <span class="filter-chip"       onclick="setFilter('OUT',this)">OUT</span>
+      <span class="filter-chip"       onclick="setFilter('IN',this)">IN</span>
+      <span class="filter-chip"       onclick="setFilter('SYS',this)">SYS</span>
+      <button id="log-clear" onclick="clearLog()">Clear</button>
+    </div>
+    <div class="panel-title">Message Log</div>
+    <div class="panel-body" id="log-container">
+      <div id="log-list"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+// ── WebSocket ──────────────────────────────────────────────────────────────
+let ws = null;
+let currentOrderId = null;
+let logFilter = 'ALL';
+let allLogEntries = [];
+
+function connect() {
+  ws = new WebSocket('ws://localhost:8000/dashboard/ws');
+
+  ws.onopen = () => {
+    document.getElementById('ws-badge').textContent = '● Connected';
+    document.getElementById('ws-badge').className = 'badge connected';
+    toast('Dashboard connected ✓', 'success');
+  };
+
+  ws.onclose = () => {
+    document.getElementById('ws-badge').textContent = '● Disconnected';
+    document.getElementById('ws-badge').className = 'badge disconnected';
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (e) => {
+    const payload = JSON.parse(e.data);
+
+    if (payload.type === 'init') {
+      updateRobotUI(payload.robot);
+      document.getElementById('s-clients').textContent = payload.flutter_clients ?? 0;
+      document.getElementById('flutter-count').textContent = `Flutter clients: ${payload.flutter_clients ?? 0}`;
+      allLogEntries = payload.log || [];
+      renderLog();
+      return;
+    }
+
+    if (payload.type === 'log') {
+      if (payload.robot) updateRobotUI(payload.robot);
+      if (payload.entry) {
+        allLogEntries.push(payload.entry);
+        if (allLogEntries.length > 300) allLogEntries.shift();
+        appendLogEntry(payload.entry);
+      }
+      return;
+    }
+
+    if (payload.type === 'control_ack') {
+      toast(`✓ ${payload.action}`, 'success');
+      return;
+    }
+  };
+}
+
+// ── UI Update ─────────────────────────────────────────────────────────────
+function updateRobotUI(r) {
+  if (!r) return;
+
+  // Battery
+  const bat = r.battery ?? 0;
+  document.getElementById('bat-txt').textContent = bat + '%';
+  const bar = document.getElementById('battery-bar');
+  bar.style.width = bat + '%';
+  bar.style.background = bat > 40 ? 'var(--success)' : bat > 20 ? 'var(--warning)' : 'var(--danger)';
+
+  // Mission chip
+  const chip = document.getElementById('mission-chip');
+  chip.textContent = r.mission_state ?? 'idle';
+  const chipColors = {
+    idle:               ['#1a2030','#4f8ef7'],
+    missionReceived:    ['#1a2f4a','#4f8ef7'],
+    headingToFruit:     ['#1a3040','#6ec6f5'],
+    visionChecking:     ['#2a1a3a','#7c5cfc'],
+    storing:            ['#2a2a1a','#f5c518'],
+    headingToCustomer:  ['#1a3040','#6ec6f5'],
+    rfidAwaiting:       ['#2a1a3a','#7c5cfc'],
+    storageOpened:      ['#1a3028','#34c77b'],
+    storageClosed:      ['#1a3028','#34c77b'],
+    returning:          ['#1a2f4a','#4f8ef7'],
+    failed:             ['#3a1a1a','#f05c5c'],
+  };
+  const [bg, fg] = chipColors[r.mission_state] ?? ['#1a2030','#aaa'];
+  chip.style.background = bg;
+  chip.style.color = fg;
+
+  setText('s-mode',    r.mode,            'primary');
+  setText('s-storage', r.storage_state,   r.storage_state === 'open' ? 'warn' : 'ok');
+  setText('s-fault',   r.fault_type,      r.fault_type !== 'none' ? 'danger' : 'ok');
+  setText('s-order',   r.active_order_id ?? '—', 'accent');
+  setText('s-fruit',   r.current_fruit   ?? '—', 'accent');
+  setText('s-dist',    (r.distance_remaining ?? 0).toFixed(2) + ' m', 'primary');
+  setText('s-obs',     r.obstacle_detected ? '⚠ Detected' : 'Clear', r.obstacle_detected ? 'danger' : 'ok');
+  setText('s-paused',  r.paused ? 'Yes ⚠' : 'No', r.paused ? 'warn' : 'ok');
+
+  if (r.active_order_id) currentOrderId = r.active_order_id;
+}
+
+function setText(id, val, cls) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = val;
+  el.className = 'state-value ' + (cls || '');
+}
+
+// ── Log ───────────────────────────────────────────────────────────────────
+function renderLog() {
+  const list = document.getElementById('log-list');
+  list.innerHTML = '';
+  allLogEntries
+    .filter(e => logFilter === 'ALL' || e.dir === logFilter)
+    .forEach(e => {
+      list.appendChild(makeLogEl(e));
+    });
+  scrollLog();
+}
+
+function appendLogEntry(entry) {
+  if (logFilter !== 'ALL' && entry.dir !== logFilter) return;
+  const list = document.getElementById('log-list');
+  list.appendChild(makeLogEl(entry));
+  if (list.children.length > 200) list.removeChild(list.firstChild);
+  scrollLog();
+}
+
+function makeLogEl(entry) {
+  const div = document.createElement('div');
+  div.className = 'log-entry';
+
+  const ts   = (entry.ts || '').slice(11, 19);
+  const dir  = entry.dir || 'SYS';
+  const src  = entry.src ? ` [${entry.src}]` : '';
+  const type = entry.msg?.type || entry.msg?.info || '';
+  const body = JSON.stringify(entry.msg, null, 0);
+  const short = body.length > 200 ? body.slice(0, 200) + '…' : body;
+
+  div.innerHTML = `
+    <div class="log-ts">${ts}${src}</div>
+    <div><span class="log-dir dir-${dir}">${dir}</span><b style="color:var(--info)">${type}</b></div>
+    <div class="log-body">${escHtml(short)}</div>
+  `;
+  return div;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function scrollLog() {
+  const c = document.getElementById('log-container');
+  c.scrollTop = c.scrollHeight;
+}
+
+function setFilter(f, el) {
+  logFilter = f;
+  document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
+  el.classList.add('active');
+  renderLog();
+}
+
+function clearLog() {
+  allLogEntries = [];
+  document.getElementById('log-list').innerHTML = '';
+}
+
+// ── Send Helpers ──────────────────────────────────────────────────────────
+function send(msg) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { toast('Not connected', 'error'); return; }
+  ws.send(JSON.stringify(msg));
+}
+
+function simRfid(success) {
+  const rfid = document.getElementById('rfid-input').value.trim() || 'RFID_A1B2C3';
+  send({ type: 'debug.rfid_simulate', rfid_card_id: rfid, order_id: currentOrderId, should_succeed: success });
+}
+
+function forceState() {
+  const state = document.getElementById('force-state-sel').value;
+  send({ type: 'debug.force_state', state });
+}
+
+function sendStorageCloseRequest() {
+  send({ type: 'storage.close_request', order_id: currentOrderId });
+  toast('storage.close_request sent!', 'success');
+}
+
+function sendTestOrder() {
+  send({
+    type: 'order.place',
+    user_id: 'user_001',
+    assigned_rfid: 'RFID_A1B2C3',
+    items: [{ product_id: 'prod_001', product_name: 'Apple', quantity: 1, unit_price: 5.0 }],
+  });
+  toast('Test order sent!', 'success');
+}
+
+async function apiPost(path, body) {
+  try {
+    const res = await fetch('http://localhost:8000' + path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    toast(JSON.stringify(data).slice(0, 60), res.ok ? 'success' : 'error');
+  } catch (e) { toast('HTTP error: ' + e.message, 'error'); }
+}
+
+// ── Toast ─────────────────────────────────────────────────────────────────
+let toastTimer = null;
+function toast(msg, type = 'info') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.borderColor = type === 'success' ? 'var(--success)' : type === 'error' ? 'var(--danger)' : 'var(--primary)';
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+connect();
+</script>
+</body>
+</html>
