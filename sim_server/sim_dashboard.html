@@ -96,9 +96,17 @@
   #log-filter { display: flex; gap: 6px; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--border); flex-shrink: 0; }
   .filter-chip { padding: 3px 9px; border-radius: 20px; font-size: 11px; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--muted); }
   .filter-chip.active { background: var(--primary); color: #fff; border-color: var(--primary); }
-  #log-clear { margin-left: auto; padding: 3px 9px; border-radius: 20px; font-size: 11px; cursor: pointer; border: 1px solid var(--border); background: var(--card); color: var(--muted); }
-
-  #copy-in-all {
+ #log-clear {
+  padding: 3px 9px;
+  border-radius: 20px;
+  font-size: 11px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted);
+}
+#copy-in-all {
+  margin-left: auto;
   padding: 3px 9px;
   border-radius: 20px;
   font-size: 11px;
@@ -421,11 +429,6 @@ function makeLogEl(entry) {
     <div class="log-body">${escHtml(body)}</div>
   `;
   return div;
-}
-
-function clearLog() {
-  allLogEntries = [];
-  document.getElementById('log-list').innerHTML = '';
 }
 
 async function copyTextToClipboard(text) {

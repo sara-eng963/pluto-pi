@@ -20,6 +20,7 @@ install(
     scripts/mission_node.py
     scripts/test_camera.py
     scripts/test_pid.py
+    scripts/rfid_node.py
     scripts/gui_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
