@@ -61,6 +61,7 @@ Example:
         current_pose = (1, 1, 90)
 """
 
+import json
 import time
 import queue
 import threading
@@ -68,6 +69,7 @@ from dataclasses import dataclass
 from typing import List, Union
 
 import rclpy
+from geometry_msgs.msg import Pose2D as RosPose2D
 from rclpy.node import Node
 from std_msgs.msg import Bool
 from std_msgs.msg import Float32
@@ -147,6 +149,16 @@ class NavigationNode(Node):
             "/navigation_result",
             10,
         )
+        self.navigation_pose_pub = self.create_publisher(
+            RosPose2D,
+            "/navigation/pose",
+            10,
+        )
+        self.navigation_status_pub = self.create_publisher(
+            String,
+            "/navigation/status",
+            10,
+        )
         self.debug_yaw_pub = self.create_publisher(
             Float32,
             "/debug_yaw",
@@ -169,11 +181,24 @@ class NavigationNode(Node):
             self.status_callback,
             10,
         )
+        self.navigation_goal_sub = self.create_subscription(
+            RosPose2D,
+            "/navigation/goal",
+            self.navigation_goal_callback,
+            10,
+        )
+        self.navigation_control_sub = self.create_subscription(
+            String,
+            "/navigation/control",
+            self.navigation_control_callback,
+            10,
+        )
 
         # Logical robot pose stored by the Pi.
         #
         # This is updated incrementally as commands complete.
         self.current_pose = current_pose
+        self.goal_queue = queue.Queue()
 
         # If dx or dy is smaller than this, skip that movement.
         self.position_tolerance = position_tolerance
@@ -373,6 +398,28 @@ class NavigationNode(Node):
             self.interrupt_requested = True
             self.send_stop()
 
+    def navigation_goal_callback(self, msg: RosPose2D):
+        """
+        Queue ROS navigation goals for execution by the main loop.
+        """
+
+        target_pose = Pose2D(x=float(msg.x), y=float(msg.y), yaw=float(msg.theta))
+        self.goal_queue.put(target_pose)
+        self.publish_navigation_status("GOAL_RECEIVED", target_pose=target_pose)
+
+    def navigation_control_callback(self, msg: String):
+        """
+        Handle out-of-band navigation control commands.
+        """
+
+        command = msg.data.strip().upper()
+        if command == "STOP":
+            self.send_stop()
+            self.publish_navigation_result("NAV_STOPPED")
+            self.publish_navigation_status("STOPPED")
+        elif command:
+            self.get_logger().warn(f"Ignoring unknown navigation control: {command}")
+
     # -------------------------------------------------------------------------
     # BASIC COMMAND FUNCTIONS
     # -------------------------------------------------------------------------
@@ -405,6 +452,7 @@ class NavigationNode(Node):
 
         self.cmd_pub.publish(msg)
         self.get_logger().info(f"SEND: {command}")
+        self.publish_navigation_status("COMMAND_EXECUTING", command=command)
 
     def request_debug_yaw_status(self):
         """
@@ -516,6 +564,42 @@ class NavigationNode(Node):
 
         self.navigation_result_pub.publish(msg)
         self.get_logger().info(f"PUB /navigation_result: {msg.data}")
+
+    def publish_current_pose(self):
+        msg = RosPose2D()
+        msg.x = float(self.current_pose.x)
+        msg.y = float(self.current_pose.y)
+        msg.theta = float(self.current_pose.yaw)
+        self.navigation_pose_pub.publish(msg)
+
+    def publish_navigation_status(
+        self,
+        status: str,
+        target_pose=None,
+        command: str = None,
+    ):
+        payload = {
+            "status": status,
+            "pose": {
+                "x": self.current_pose.x,
+                "y": self.current_pose.y,
+                "yaw": self.current_pose.yaw,
+            },
+        }
+
+        if target_pose is not None:
+            payload["goal"] = {
+                "x": target_pose.x,
+                "y": target_pose.y,
+                "yaw": target_pose.yaw,
+            }
+
+        if command is not None:
+            payload["command"] = command
+
+        msg = String()
+        msg.data = json.dumps(payload, separators=(",", ":"))
+        self.navigation_status_pub.publish(msg)
 
     def is_motion_command(self, command: str) -> bool:
         """
@@ -1042,6 +1126,7 @@ class NavigationNode(Node):
             self.apply_move_to_logical_pose(STATIC_AVOIDANCE_DISTANCE, avoid_heading)
             self.get_logger().info("Pose updated after static sidestep update.")
             self.current_pose.yaw = interrupted_heading
+            self.publish_current_pose()
             self.static_avoidance_active = False
 
             self.interrupt_requested = False
@@ -1440,6 +1525,7 @@ class NavigationNode(Node):
             f"y={self.current_pose.y:.2f}, "
             f"yaw={self.current_pose.yaw:.1f}"
         )
+        self.publish_current_pose()
 
 
 # =============================================================================
@@ -1535,6 +1621,26 @@ def print_help():
 # MAIN
 # =============================================================================
 
+def execute_navigation_request(node: NavigationNode, target_pose: Pose2D) -> bool:
+    """
+    Execute a queued ROS or terminal goal with the shared result lifecycle.
+    """
+
+    node.publish_navigation_result("NAV_STARTED", target_pose)
+    node.publish_navigation_status("STARTED", target_pose=target_pose)
+    success = node.execute_navigation_to(target_pose)
+
+    if success:
+        node.publish_current_pose()
+        node.publish_navigation_result("NAV_DONE", target_pose)
+        node.publish_navigation_status("COMPLETED", target_pose=target_pose)
+    else:
+        node.publish_navigation_result("NAV_FAILED", target_pose)
+        node.publish_navigation_status("FAILED", target_pose=target_pose)
+
+    return success
+
+
 def main(args=None):
     """
     Main entry point.
@@ -1596,12 +1702,24 @@ def main(args=None):
             rclpy.spin_once(node, timeout_sec=0.1)
 
             try:
+                queued_goal = node.goal_queue.get_nowait()
+            except queue.Empty:
+                queued_goal = None
+
+            if queued_goal is not None:
+                execute_navigation_request(node, queued_goal)
+                continue
+
+            try:
                 line = input_queue.get_nowait()
             except queue.Empty:
                 continue
 
             if line == "__EOF__":
-                break
+                node.get_logger().info(
+                    "Terminal input reached EOF; continuing in ROS goal mode."
+                )
+                continue
 
             line = line.strip()
 
@@ -1632,6 +1750,7 @@ def main(args=None):
             if result == "STOP":
                 node.send_stop()
                 node.publish_navigation_result("NAV_STOPPED")
+                node.publish_navigation_status("STOPPED")
                 continue
 
             if result == "POSE":
@@ -1649,14 +1768,11 @@ def main(args=None):
                 f"yaw={target_pose.yaw:.1f}"
             )
 
-            node.publish_navigation_result("NAV_STARTED", target_pose)
-            success = node.execute_navigation_to(target_pose)
+            success = execute_navigation_request(node, target_pose)
 
             if success:
-                node.publish_navigation_result("NAV_DONE", target_pose)
                 print("Navigation succeeded.")
             else:
-                node.publish_navigation_result("NAV_FAILED", target_pose)
                 print("Navigation failed.")
 
             print()
