@@ -540,6 +540,7 @@ class MissionNode(Node):
             self.active_fruit = ""
             self.active_user_id = ""
             self.assigned_rfid = ""
+            self.latest_valid = False
 
             self._set_traffic("O")
             self._publish_mission_state()
@@ -565,6 +566,7 @@ class MissionNode(Node):
             self.active_user_id = ""
             self.assigned_rfid = ""
             self.active_fruit = ""
+            self.latest_valid = False
 
             self._set_traffic("Y")
             self._publish_mission_state()
@@ -603,6 +605,7 @@ class MissionNode(Node):
                     "Navigation failed.",
                     0,
                 )
+                return
             else:
                 self.get_logger().warn(
                     f"Ignoring NAV_FAILED because mission_state={self.mission_state}"
@@ -633,11 +636,18 @@ class MissionNode(Node):
             if self.latest_valid:
                 if (not self.storage_sequence_running) and (not self.storage_done_for_current_target):
                     self.get_logger().info("/valid already true at NAV_DONE. Starting storage sequence.")
+
+                    self.mission_state = "storing"
+                    self._publish_mission_state()
+                    self._publish_mission_event(
+                        "storing",
+                        f"{self.active_fruit} validated. Starting storage sequence.",
+                        45,
+                    )
+
                     self.waiting_for_valid = False
                     self.storage_done_for_current_target = True
                     self._start_storage_sequence_thread()
-
-            return
 
         # Case 2: robot reached customer pose, which is HOME = 0,0,0
         if self.mission_state == "headingToCustomer":
@@ -815,6 +825,10 @@ class MissionNode(Node):
         self.assigned_rfid = order.get("assigned_rfid", "")
         self.active_fruit = fruit
         self.fault_type = "none"
+        self.latest_valid = False
+        self.waiting_for_valid = False
+        self.storage_done_for_current_target = False
+
 
         self.mission_state = "missionReceived"
         self._publish_mission_state()
@@ -837,7 +851,7 @@ class MissionNode(Node):
             15,
         )
         self._publish_navigation_goal(x, y, theta)
-
+        
     def obstacle_callback(self, msg: Int32):
         self.latest_mask = msg.data
         now = time.monotonic()
