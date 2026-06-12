@@ -82,7 +82,12 @@
   .log-entry { padding: 6px 8px; border-radius: 5px; border: 1px solid var(--border); font-size: 11px; word-break: break-all; }
   .log-entry .log-ts  { color: var(--muted); font-size: 10px; margin-bottom: 2px; }
   .log-entry .log-dir { font-weight: 700; font-size: 10px; margin-right: 5px; padding: 1px 5px; border-radius: 3px; }
-  .log-entry .log-body { font-family: 'Cascadia Code', 'Consolas', monospace; color: #c9d1e8; }
+  .log-entry .log-body {
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  color: #c9d1e8;
+  white-space: pre-wrap;
+  word-break: break-word;
+  }
   .dir-OUT  { background: #1a2f4a; color: var(--primary); }
   .dir-IN   { background: #1a3a28; color: var(--success); }
   .dir-SYS  { background: #2a2230; color: var(--accent);  }
@@ -377,9 +382,8 @@ function makeLogEl(entry) {
   const dir  = entry.dir || 'SYS';
   const src  = entry.src ? ` [${entry.src}]` : '';
   const type = entry.msg?.type || entry.msg?.info || '';
-  const body = JSON.stringify(entry.msg, null, 0);
-  const short = body.length > 200 ? body.slice(0, 200) + '…' : body;
-
+  const body = JSON.stringify(entry.msg, null, 2);
+  const short = body;
   div.innerHTML = `
     <div class="log-ts">${ts}${src}</div>
     <div><span class="log-dir dir-${dir}">${dir}</span><b style="color:var(--info)">${type}</b></div>
