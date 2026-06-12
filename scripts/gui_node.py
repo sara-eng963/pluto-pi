@@ -34,6 +34,7 @@ import rclpy
 from rclpy.node import Node
 
 from std_msgs.msg import String, Bool, Float32, Int32
+from geometry_msgs.msg import Pose2D
 
 try:
     import websockets
@@ -142,12 +143,47 @@ class GuiNode(Node):
             10,
         )
 
+        self.mission_state_sub = self.create_subscription(
+            String,
+            "/mission/state",
+            self.mission_state_callback,
+            10,
+        )
+
+        self.mission_event_sub = self.create_subscription(
+            String,
+            "/mission/event",
+            self.mission_event_callback,
+            10,
+        )
+
+        self.navigation_status_sub = self.create_subscription(
+            String,
+            "/navigation/status",
+            self.navigation_status_callback,
+            10,
+        )
+
+        self.navigation_pose_sub = self.create_subscription(
+            Pose2D,
+            "/navigation/pose",
+            self.navigation_pose_callback,
+            10,
+        )
+
         # ------------------------------------------------------------------
         # Cached ROS state for GUI messages
         # ------------------------------------------------------------------
         self.latest_detected_fruit = "Unknown"
         self.latest_detected_confidence = 0.0
         self.latest_valid = False
+        self.latest_mission_state = "idle"
+        self.latest_active_order_id = ""
+        self.latest_fault_type = "none"
+        self.latest_current_fruit = ""
+        self.latest_storage_state = "closed"
+        self.latest_obstacle_detected = False
+        self.latest_distance_remaining = 0.0
 
         self.last_drive_status_gui_time = 0.0
         self.drive_status_throttle_sec = 1.0
@@ -445,6 +481,149 @@ class GuiNode(Node):
     # ROS -> Dashboard WS
     # ======================================================================
 
+    def mission_state_callback(self, msg: String):
+            """
+            Convert ROS /mission/state JSON into GUI robot.status JSON.
+            """
+
+            try:
+                data = json.loads(msg.data)
+            except json.JSONDecodeError:
+                self.get_logger().warn(f"Invalid /mission/state JSON: {msg.data}")
+                return
+
+            mission_state = data.get("mission_state", "idle")
+            order_id = data.get("order_id", "")
+            fruit = data.get("fruit", "")
+            fault_type = data.get("fault_type", "none")
+
+            self.latest_mission_state = mission_state
+            self.latest_active_order_id = order_id
+            self.latest_current_fruit = fruit
+            self.latest_fault_type = fault_type
+
+            # Temporary storage state inference for current stage.
+            # Later mission_node should publish exact storage state.
+            storage_state = "closed"
+            if mission_state == "storageOpened":
+                storage_state = "open"
+            elif mission_state == "storageClosed":
+                storage_state = "closed"
+            elif mission_state == "storing":
+                storage_state = "closed"
+
+            self.latest_storage_state = storage_state
+
+            self.send_dashboard_json(
+                {
+                    "type": "robot.status",
+                    "battery_percent": 82,
+                    "is_charging": False,
+                    "mode": "autonomous",
+                    "mission_state": mission_state,
+                    "storage_state": storage_state,
+                    "fault_type": fault_type,
+                    "active_order_id": order_id,
+                    "linear_speed": 0.0,
+                    "angular_speed": 0.0,
+                    "distance_remaining": float(self.latest_distance_remaining),
+                    "obstacle_detected": bool(self.latest_obstacle_detected),
+                    "current_fruit": fruit.lower() if fruit else "",
+                    "timestamp": now_iso(),
+                }
+            )
+
+
+    def mission_event_callback(self, msg: String):
+            """
+            Convert ROS /mission/event JSON into GUI mission.event and event.log JSON.
+            """
+
+            try:
+                data = json.loads(msg.data)
+            except json.JSONDecodeError:
+                self.get_logger().warn(f"Invalid /mission/event JSON: {msg.data}")
+                return
+
+            order_id = data.get("order_id", "")
+            event = data.get("event", "")
+            message = data.get("message", "")
+            progress_percent = int(data.get("progress_percent", 0))
+
+            # Main timeline event for Flutter/GUI.
+            self.send_dashboard_json(
+                {
+                    "type": "mission.event",
+                    "order_id": order_id,
+                    "event": event,
+                    "message": message,
+                    "progress_percent": progress_percent,
+                    "timestamp": now_iso(),
+                }
+            )
+
+            # Human-readable event log.
+            self.send_dashboard_json(
+                {
+                    "type": "event.log",
+                    "level": "mission",
+                    "event_type": event,
+                    "message": message,
+                    "order_id": order_id,
+                    "timestamp": now_iso(),
+                }
+            )
+
+
+    def navigation_status_callback(self, msg: String):
+            """
+            Convert ROS /navigation/status JSON into GUI navigation.path_status JSON.
+            """
+
+            try:
+                data = json.loads(msg.data)
+            except json.JSONDecodeError:
+                self.get_logger().warn(f"Invalid /navigation/status JSON: {msg.data}")
+                return
+
+            status = data.get("status", "")
+            goal = data.get("goal", {}) or {}
+
+            state = "clear"
+            if status in ("FAILED", "STOPPED"):
+                state = "blocked"
+
+            target_x = float(goal.get("x", 0.0))
+            target_y = float(goal.get("y", 0.0))
+
+            self.send_dashboard_json(
+                {
+                    "type": "navigation.path_status",
+                    "state": state,
+                    "target_x": target_x,
+                    "target_y": target_y,
+                    "distance_to_goal": float(self.latest_distance_remaining),
+                    "estimated_seconds": 0,
+                    "timestamp": now_iso(),
+                }
+            )
+
+
+    def navigation_pose_callback(self, msg: Pose2D):
+            """
+            Convert ROS /navigation/pose into GUI navigation.pose JSON.
+            """
+
+            self.send_dashboard_json(
+                {
+                    "type": "navigation.pose",
+                    "x": float(msg.x),
+                    "y": float(msg.y),
+                    "heading_degrees": float(msg.theta),
+                    "timestamp": now_iso(),
+                }
+            )
+
     def navigation_result_callback(self, msg: String):
         text = msg.data.strip()
 
@@ -481,6 +660,7 @@ class GuiNode(Node):
     def obstacle_status_callback(self, msg: Int32):
         mask = int(msg.data)
         blocking = mask != 0
+        self.latest_obstacle_detected = blocking
 
         self.send_dashboard_json(
             {
