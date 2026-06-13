@@ -488,7 +488,6 @@ class MissionNode(Node):
 
     def valid_callback(self, msg: Bool):
         self.latest_valid = msg.data
-        self.get_logger().info(f"RX /valid: {msg.data}")
 
         if not msg.data:
             return
