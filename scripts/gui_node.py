@@ -534,13 +534,13 @@ class GuiNode(Node):
     def _battery_percent_from_voltage(self, voltage: float) -> int:
         """
         Simple linear estimate:
-        9.0 V  -> 0%
-        12.0 V -> 100%
+        7.5 V  -> 0%
+        12.6 V -> 100%
 
         This is only GUI telemetry estimation, not BMS logic.
         """
 
-        percent = int(round(((voltage - 9.0) / (12.0 - 9.0)) * 100.0))
+        percent = int(round(((voltage - 7.5) / (12.6 - 7.5)) * 100.0))
         return max(0, min(100, percent))
 
 
