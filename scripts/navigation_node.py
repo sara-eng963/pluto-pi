@@ -352,13 +352,6 @@ class NavigationNode(Node):
             )
             return
 
-        if self.close_to_active_target():
-            self.get_logger().info(
-                f"Ignoring obstacle event near target: {event} "
-                f"distance_to_target={self.distance_to_active_target():.2f} m"
-            )
-            return
-
         if event.startswith("DYNAMIC_OBSTACLE_CLEARED"):
             if not self.obstacle_active:
                 self.get_logger().info(
@@ -378,6 +371,13 @@ class NavigationNode(Node):
                 f"Ignoring obstacle event during non-MOVE command: {event}"
             )
             return
+
+        if event.startswith("OBSTACLE_DETECTED") or event.startswith("STATIC_OBSTACLE"):
+            if self.close_to_active_target_during_move():
+                self.get_logger().info(
+                    f"Ignoring obstacle event near active target: {event}"
+                )
+                return
 
         if event.startswith("OBSTACLE_DETECTED"):
             self.get_logger().warn(f"OBSTACLE EVENT: {event}")
@@ -925,7 +925,7 @@ class NavigationNode(Node):
 
         return False
 
-    def request_move_status_after_stop(self):
+    def request_move_status_now(self):
         """
         Send STATUS to ESP1 and parse the move-progress response.
 
@@ -938,12 +938,12 @@ class NavigationNode(Node):
         self.publish_command("STATUS")
 
         if not self.wait_for_status_response(timeout_sec=5.0):
-            self.get_logger().error("Failed to get STATUS from ESP1 after STOP.")
+            self.get_logger().error("Failed to get STATUS from ESP1.")
             return None
 
         parsed = self.parse_move_status(self.last_status_text)
         if parsed is None:
-            self.get_logger().error("Cannot resume: STATUS parse failed.")
+            self.get_logger().error("Move STATUS parse failed.")
             return None
 
         return parsed
@@ -971,7 +971,7 @@ class NavigationNode(Node):
         except ValueError:
             return False
 
-        parsed = self.request_move_status_after_stop()
+        parsed = self.request_move_status_now()
         if parsed is None:
             self.get_logger().error(
                 "Cannot compute remaining distance: STATUS failed."
@@ -1314,16 +1314,63 @@ class NavigationNode(Node):
             and abs(self.normalize_yaw_deg(a.yaw) - self.normalize_yaw_deg(b.yaw)) < 1e-6
         )
 
-    def distance_to_active_target(self) -> float:
+    def estimated_distance_to_target_during_move(self) -> float:
+        """
+        Estimate distance to active target during the currently executing MOVE.
+
+        current_pose is stale during MOVE, so use ESP STATUS progress:
+        STATUS gives moved distance along the active MOVE.
+        Add moved distance to current_pose temporarily, then compute distance to
+        active_target_pose.
+        """
+
         if self.active_target_pose is None:
             return 999.0
 
-        dx = self.active_target_pose.x - self.current_pose.x
-        dy = self.active_target_pose.y - self.current_pose.y
+        if not self.current_command_is_move():
+            dx = self.active_target_pose.x - self.current_pose.x
+            dy = self.active_target_pose.y - self.current_pose.y
+            return (dx * dx + dy * dy) ** 0.5
+
+        parsed = self.request_move_status_now()
+        if parsed is None:
+            return 999.0
+
+        target_distance, moved_distance, status_heading = parsed
+
+        parts = self.current_executing_command.strip().split()
+        try:
+            command_heading = float(parts[2]) if len(parts) >= 3 else status_heading
+        except ValueError:
+            command_heading = status_heading
+
+        heading = self.normalize_yaw_deg(command_heading)
+
+        estimated_x = self.current_pose.x
+        estimated_y = self.current_pose.y
+
+        if abs(heading - 0.0) < 1e-3:
+            estimated_x += moved_distance
+        elif abs(abs(heading) - 180.0) < 1e-3:
+            estimated_x -= moved_distance
+        elif abs(heading - 90.0) < 1e-3:
+            estimated_y += moved_distance
+        elif abs(heading + 90.0) < 1e-3:
+            estimated_y -= moved_distance
+        else:
+            return 999.0
+
+        dx = self.active_target_pose.x - estimated_x
+        dy = self.active_target_pose.y - estimated_y
         return (dx * dx + dy * dy) ** 0.5
 
-    def close_to_active_target(self) -> bool:
-        return self.distance_to_active_target() <= TARGET_OBSTACLE_IGNORE_DISTANCE
+    def close_to_active_target_during_move(self) -> bool:
+        distance = self.estimated_distance_to_target_during_move()
+        self.get_logger().info(
+            f"Near-target obstacle check: distance_to_target={distance:.3f} m, "
+            f"threshold={TARGET_OBSTACLE_IGNORE_DISTANCE:.3f} m"
+        )
+        return distance <= TARGET_OBSTACLE_IGNORE_DISTANCE
 
     def manhattan_commands(self, target_pose: Pose2D, axis_order: str = "XY") -> List[str]:
         """
