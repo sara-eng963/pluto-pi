@@ -229,6 +229,7 @@ class NavigationNode(Node):
         self.interrupt_requested = False
 
         self.current_executing_command = ""
+        self.current_move_start_pose = None
         self.interrupted_command = ""
 
         self.remaining_move_distance = 0.0
@@ -1316,47 +1317,42 @@ class NavigationNode(Node):
 
     def estimated_distance_to_target_during_move(self) -> float:
         """
-        Estimate distance to active target during the currently executing MOVE.
-
-        current_pose is stale during MOVE, so use ESP STATUS progress:
-        STATUS gives moved distance along the active MOVE.
-        Add moved distance to current_pose temporarily, then compute distance to
-        active_target_pose.
+        Estimate distance from the current MOVE's commanded end to the target.
         """
 
-        if self.active_target_pose is None:
+        if self.active_target_pose is None or self.current_move_start_pose is None:
             return 999.0
 
         if not self.current_command_is_move():
-            dx = self.active_target_pose.x - self.current_pose.x
-            dy = self.active_target_pose.y - self.current_pose.y
-            return (dx * dx + dy * dy) ** 0.5
-
-        parsed = self.request_move_status_now()
-        if parsed is None:
             return 999.0
 
-        target_distance, moved_distance, status_heading = parsed
-
         parts = self.current_executing_command.strip().split()
+        if len(parts) < 2:
+            return 999.0
+
         try:
-            command_heading = float(parts[2]) if len(parts) >= 3 else status_heading
+            move_distance = float(parts[1])
+            command_heading = (
+                float(parts[2])
+                if len(parts) >= 3
+                else self.current_move_start_pose.yaw
+            )
         except ValueError:
-            command_heading = status_heading
+            return 999.0
 
         heading = self.normalize_yaw_deg(command_heading)
 
-        estimated_x = self.current_pose.x
-        estimated_y = self.current_pose.y
+        estimated_x = self.current_move_start_pose.x
+        estimated_y = self.current_move_start_pose.y
 
         if abs(heading - 0.0) < 1e-3:
-            estimated_x += moved_distance
+            estimated_x += move_distance
         elif abs(abs(heading) - 180.0) < 1e-3:
-            estimated_x -= moved_distance
+            estimated_x -= move_distance
         elif abs(heading - 90.0) < 1e-3:
-            estimated_y += moved_distance
+            estimated_y += move_distance
         elif abs(heading + 90.0) < 1e-3:
-            estimated_y -= moved_distance
+            estimated_y -= move_distance
         else:
             return 999.0
 
@@ -1496,6 +1492,15 @@ class NavigationNode(Node):
             self.get_logger().info(f"Navigation step {index}/{len(commands)}")
 
             self.current_executing_command = command
+
+            if command.strip().upper().startswith("MOVE"):
+                self.current_move_start_pose = Pose2D(
+                    self.current_pose.x,
+                    self.current_pose.y,
+                    self.current_pose.yaw,
+                )
+            else:
+                self.current_move_start_pose = None
 
             if self.is_motion_command(command):
                 self.command_active = True
