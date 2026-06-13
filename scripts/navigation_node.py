@@ -78,6 +78,7 @@ from std_msgs.msg import String
 
 STATIC_AVOIDANCE_DISTANCE = 0.50
 MAX_STATIC_AVOIDANCE_ATTEMPTS = 3
+TARGET_OBSTACLE_IGNORE_DISTANCE = 0.50  # meters
 INTERRUPT_RESUMED = "INTERRUPT_RESUMED"
 STATIC_AVOIDANCE_DONE = "STATIC_AVOIDANCE_DONE"
 INTERRUPT_FAILED = "INTERRUPT_FAILED"
@@ -348,6 +349,13 @@ class NavigationNode(Node):
         if not self.command_active:
             self.get_logger().info(
                 f"Ignoring obstacle event because no command is active: {event}"
+            )
+            return
+
+        if self.close_to_active_target():
+            self.get_logger().info(
+                f"Ignoring obstacle event near target: {event} "
+                f"distance_to_target={self.distance_to_active_target():.2f} m"
             )
             return
 
@@ -1305,6 +1313,17 @@ class NavigationNode(Node):
             and abs(a.y - b.y) < 1e-6
             and abs(self.normalize_yaw_deg(a.yaw) - self.normalize_yaw_deg(b.yaw)) < 1e-6
         )
+
+    def distance_to_active_target(self) -> float:
+        if self.active_target_pose is None:
+            return 999.0
+
+        dx = self.active_target_pose.x - self.current_pose.x
+        dy = self.active_target_pose.y - self.current_pose.y
+        return (dx * dx + dy * dy) ** 0.5
+
+    def close_to_active_target(self) -> bool:
+        return self.distance_to_active_target() <= TARGET_OBSTACLE_IGNORE_DISTANCE
 
     def manhattan_commands(self, target_pose: Pose2D, axis_order: str = "XY") -> List[str]:
         """
