@@ -163,7 +163,7 @@ class VisionNode(Node):
         input_data = np.expand_dims(resized, axis=0)
 
         if self.input_dtype == np.float32:
-            input_data = input_data.astype(np.float32) / 255.0
+            input_data = (input_data.astype(np.float32) - 127.5) / 127.5
         else:
             input_data = input_data.astype(self.input_dtype)
 
