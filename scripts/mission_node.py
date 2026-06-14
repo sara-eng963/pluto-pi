@@ -511,9 +511,6 @@ class MissionNode(Node):
             self._start_storage_sequence_thread()
             return
 
-        if self.storage_sequence_running or self.storage_done_for_current_target:
-            self.get_logger().info("Duplicate /valid=true ignored: storage already started or done for current target.")
-
     def mission_control_callback(self, msg: String):
         self.get_logger().info(f"RX /mission/control: {msg.data}")
 
