@@ -145,6 +145,11 @@ class NavigationNode(Node):
             "/mission_reset_obstacle",
             10,
         )
+        self.obstacle_ignore_zone_pub = self.create_publisher(
+            Bool,
+            "/navigation/obstacle_ignore_zone",
+            10,
+        )
         self.navigation_result_pub = self.create_publisher(
             String,
             "/navigation_result",
@@ -245,6 +250,8 @@ class NavigationNode(Node):
         self.navigation_active = False
         self.command_active = False
         self.static_avoidance_active = False
+        self.obstacle_ignore_zone_active = False
+        self.set_obstacle_ignore_zone(False, force=True)
 
         self.active_target_pose = None
         self.static_avoidance_count = 0
@@ -423,6 +430,7 @@ class NavigationNode(Node):
 
         command = msg.data.strip().upper()
         if command == "STOP":
+            self.set_obstacle_ignore_zone(False, force=True)
             self.send_stop()
             self.publish_navigation_result("NAV_STOPPED")
             self.publish_navigation_status("STOPPED")
@@ -462,6 +470,36 @@ class NavigationNode(Node):
         self.cmd_pub.publish(msg)
         self.get_logger().info(f"SEND: {command}")
         self.publish_navigation_status("COMMAND_EXECUTING", command=command)
+
+    def set_obstacle_ignore_zone(self, active: bool, force: bool = False):
+        """
+        Publish the shared fruit-pickup obstacle ignore zone state.
+        """
+
+        active = bool(active)
+        if not force and self.obstacle_ignore_zone_active == active:
+            return
+
+        self.obstacle_ignore_zone_active = active
+
+        msg = Bool()
+        msg.data = active
+        self.obstacle_ignore_zone_pub.publish(msg)
+
+        if active:
+            self.get_logger().info("Obstacle ignore zone ACTIVE near target")
+        else:
+            self.get_logger().info("Obstacle ignore zone INACTIVE")
+
+    def refresh_obstacle_ignore_zone(self):
+        active = (
+            self.navigation_active
+            and self.command_active
+            and not self.static_avoidance_active
+            and self.current_command_is_move()
+            and self.close_to_active_target_during_move()
+        )
+        self.set_obstacle_ignore_zone(active)
 
     def request_debug_yaw_status(self):
         """
@@ -545,6 +583,7 @@ class NavigationNode(Node):
         Send STOP to ESP.
         """
 
+        self.set_obstacle_ignore_zone(False, force=True)
         self.get_logger().warn("Sending STOP.")
         self.publish_command("STOP")
 
@@ -559,6 +598,9 @@ class NavigationNode(Node):
         self.get_logger().info("Published /mission_reset_obstacle = true")
 
     def publish_navigation_result(self, event: str, target_pose=None):
+        if event in ("NAV_DONE", "NAV_FAILED", "NAV_STOPPED"):
+            self.set_obstacle_ignore_zone(False, force=True)
+
         msg = String()
 
         if target_pose is None:
@@ -730,9 +772,15 @@ class NavigationNode(Node):
         """
 
         start_time = time.time()
+        last_ignore_zone_refresh = 0.0
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.01)
+
+            now = time.time()
+            if now - last_ignore_zone_refresh >= 0.2:
+                self.refresh_obstacle_ignore_zone()
+                last_ignore_zone_refresh = now
 
             if self.interrupt_requested and not self.static_avoidance_active:
                 return "INTERRUPTED"
@@ -777,13 +825,16 @@ class NavigationNode(Node):
         if not command:
             return "DONE"
 
+        self.set_obstacle_ignore_zone(False)
         self.reset_wait_flags()
         self.expected_done_keyword = self.expected_done_from_command(command)
 
         self.publish_command(command)
+        self.refresh_obstacle_ignore_zone()
 
         # STATUS / STOP / tuning commands.
         if not self.is_motion_command(command):
+            self.set_obstacle_ignore_zone(False, force=True)
             got_response = self.wait_for_any_response(timeout_sec=ack_timeout_sec)
 
             if not got_response:
@@ -797,6 +848,7 @@ class NavigationNode(Node):
 
         if not got_ack:
             self.get_logger().error(f"No valid ACK for command: {command}")
+            self.set_obstacle_ignore_zone(False, force=True)
             return "FAILED"
 
         # Then wait for DONE.
@@ -806,6 +858,8 @@ class NavigationNode(Node):
             self.get_logger().info(f"Command completed: {command}")
         elif result == "FAILED":
             self.get_logger().error(f"Command did not finish: {command}")
+
+        self.set_obstacle_ignore_zone(False, force=True)
 
         return result
 
@@ -1109,6 +1163,7 @@ class NavigationNode(Node):
             self.obstacle_active = False
             self.waiting_dynamic_clear = False
             self.static_blocked = False
+            self.set_obstacle_ignore_zone(False, force=True)
             self.static_avoidance_active = True
 
             avoidance_commands = [
@@ -1125,6 +1180,7 @@ class NavigationNode(Node):
                         f"Static avoidance command failed: {avoid_cmd}"
                     )
                     self.static_avoidance_active = False
+                    self.set_obstacle_ignore_zone(False, force=True)
                     self.send_stop()
                     return INTERRUPT_FAILED
 
@@ -1137,6 +1193,7 @@ class NavigationNode(Node):
             self.current_pose.yaw = interrupted_heading
             self.publish_current_pose()
             self.static_avoidance_active = False
+            self.set_obstacle_ignore_zone(False, force=True)
 
             self.interrupt_requested = False
             self.obstacle_active = False
@@ -1360,8 +1417,51 @@ class NavigationNode(Node):
         dy = self.active_target_pose.y - estimated_y
         return (dx * dx + dy * dy) ** 0.5
 
+    def estimated_current_distance_to_target_during_move(self) -> float:
+        """
+        Estimate distance from the current MOVE progress to the target.
+        """
+
+        if self.active_target_pose is None or self.current_move_start_pose is None:
+            return 999.0
+
+        if not self.current_command_is_move():
+            return 999.0
+
+        parsed = None
+        if (
+            self.last_status_text.startswith("STATUS")
+            and "target=" in self.last_status_text
+            and "dist=" in self.last_status_text
+        ):
+            parsed = self.parse_move_status(self.last_status_text)
+
+        if parsed is None:
+            return self.estimated_distance_to_target_during_move()
+
+        _, moved_distance, heading = parsed
+        heading = self.normalize_yaw_deg(heading)
+
+        estimated_x = self.current_move_start_pose.x
+        estimated_y = self.current_move_start_pose.y
+
+        if abs(heading - 0.0) < 1e-3:
+            estimated_x += moved_distance
+        elif abs(abs(heading) - 180.0) < 1e-3:
+            estimated_x -= moved_distance
+        elif abs(heading - 90.0) < 1e-3:
+            estimated_y += moved_distance
+        elif abs(heading + 90.0) < 1e-3:
+            estimated_y -= moved_distance
+        else:
+            return self.estimated_distance_to_target_during_move()
+
+        dx = self.active_target_pose.x - estimated_x
+        dy = self.active_target_pose.y - estimated_y
+        return (dx * dx + dy * dy) ** 0.5
+
     def close_to_active_target_during_move(self) -> bool:
-        distance = self.estimated_distance_to_target_during_move()
+        distance = self.estimated_current_distance_to_target_during_move()
         self.get_logger().info(
             f"Near-target obstacle check: distance_to_target={distance:.3f} m, "
             f"threshold={TARGET_OBSTACLE_IGNORE_DISTANCE:.3f} m"
@@ -1467,6 +1567,7 @@ class NavigationNode(Node):
         # stale queued callbacks while idle so old obstacle events are ignored.
         self.navigation_active = False
         self.command_active = False
+        self.set_obstacle_ignore_zone(False, force=True)
         self.obstacle_active = False
         self.waiting_dynamic_clear = False
         self.static_blocked = False
@@ -1491,6 +1592,7 @@ class NavigationNode(Node):
         for index, command in enumerate(commands, start=1):
             self.get_logger().info(f"Navigation step {index}/{len(commands)}")
 
+            self.set_obstacle_ignore_zone(False, force=True)
             self.current_executing_command = command
 
             if command.strip().upper().startswith("MOVE"):
@@ -1511,6 +1613,7 @@ class NavigationNode(Node):
                 self.update_pose_after_successful_command(command, context="normal")
                 if self.is_motion_command(command):
                     self.command_active = False
+                self.set_obstacle_ignore_zone(False, force=True)
                 pass  # continue to next command
 
             elif result == "INTERRUPTED":
@@ -1518,6 +1621,7 @@ class NavigationNode(Node):
 
                 if self.is_motion_command(command):
                     self.command_active = False
+                self.set_obstacle_ignore_zone(False, force=True)
 
                 if interrupt_result == INTERRUPT_RESUMED:
                     pass
@@ -1531,6 +1635,7 @@ class NavigationNode(Node):
                         self.send_stop()
                         self.command_active = False
                         self.navigation_active = False
+                        self.set_obstacle_ignore_zone(False, force=True)
                         self.active_target_pose = None
                         self.static_avoidance_count = 0
                         self.next_axis_order = "XY"
@@ -1541,10 +1646,13 @@ class NavigationNode(Node):
                     )
                     self.navigation_active = False
                     self.command_active = False
+                    self.set_obstacle_ignore_zone(False, force=True)
                     return self.execute_navigation_to(self.active_target_pose)
                 else:
                     self.get_logger().error("Navigation stopped due to obstacle.")
                     self.navigation_active = False
+                    self.command_active = False
+                    self.set_obstacle_ignore_zone(False, force=True)
                     self.active_target_pose = None
                     self.static_avoidance_count = 0
                     self.next_axis_order = "XY"
@@ -1555,6 +1663,7 @@ class NavigationNode(Node):
                 self.send_stop()
                 self.command_active = False
                 self.navigation_active = False
+                self.set_obstacle_ignore_zone(False, force=True)
                 self.active_target_pose = None
                 self.static_avoidance_count = 0
                 self.next_axis_order = "XY"
@@ -1579,6 +1688,7 @@ class NavigationNode(Node):
 
         self.command_active = False
         self.navigation_active = False
+        self.set_obstacle_ignore_zone(False, force=True)
         self.active_target_pose = None
         self.static_avoidance_count = 0
         self.next_axis_order = "XY"

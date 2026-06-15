@@ -71,6 +71,7 @@ class MissionNode(Node):
         self.waiting_for_rfid = False
         self.rfid_verified = False
         self.waiting_for_storage_close = False
+        self.navigation_obstacle_ignore_zone = False
 
         # Customer pose is HOME for this project
         self.customer_pose = (0.0, 0.0, 0.0)
@@ -87,6 +88,12 @@ class MissionNode(Node):
             Int32,
             "/obstacle_status",
             self.obstacle_callback,
+            10,
+        )
+        self.navigation_obstacle_ignore_zone_sub = self.create_subscription(
+            Bool,
+            "/navigation/obstacle_ignore_zone",
+            self.navigation_obstacle_ignore_zone_callback,
             10,
         )
 
@@ -226,6 +233,15 @@ class MissionNode(Node):
 
 
     def _publish_mission_state(self):
+        if self.mission_state in [
+            "rfidAwaiting",
+            "storageOpened",
+            "storageClosed",
+            "idle",
+            "failed",
+        ]:
+            self.navigation_obstacle_ignore_zone = False
+
         self._publish_json(
             self.mission_state_pub,
             {
@@ -287,6 +303,15 @@ class MissionNode(Node):
         if msg.data:
             self.get_logger().info("RX: /mission_reset_obstacle = true")
             self.reset_obstacle_state()
+
+    def navigation_obstacle_ignore_zone_callback(self, msg: Bool):
+        self.navigation_obstacle_ignore_zone = bool(msg.data)
+
+    def _should_ignore_obstacle_near_target(self) -> bool:
+        return (
+            self.navigation_obstacle_ignore_zone
+            and self.mission_state in ["headingToFruit", "headingToCustomer"]
+        ) or self.mission_state in ["visionChecking", "storing"]
 
     def reset_obstacle_state(self):
         self.state = "CLEAR"
@@ -848,7 +873,23 @@ class MissionNode(Node):
         self._publish_navigation_goal(x, y, theta)
         
     def obstacle_callback(self, msg: Int32):
-        self.latest_mask = msg.data
+        latest_mask = msg.data
+        self.latest_mask = latest_mask
+
+        if latest_mask != 0 and self._should_ignore_obstacle_near_target():
+            self.get_logger().info(
+                f"Ignoring obstacle mask={latest_mask} because robot is in navigation target ignore zone."
+            )
+
+            if self.state in ["WAITING_FOR_CLEAR", "STATIC_LOCKED"]:
+                self.state = "CLEAR"
+                self.get_logger().info("STATE: CLEAR")
+                self._set_traffic("Y")
+
+            self.obstacle_start_time = None
+            self.previous_mask = 0
+            return
+
         now = time.monotonic()
 
         # ---------------------------------------------------------------------
