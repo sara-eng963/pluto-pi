@@ -78,7 +78,8 @@ from std_msgs.msg import String
 
 STATIC_AVOIDANCE_DISTANCE = 0.50
 MAX_STATIC_AVOIDANCE_ATTEMPTS = 3
-TARGET_OBSTACLE_IGNORE_DISTANCE = 0.50  # meters
+FRUIT_TARGET_OBSTACLE_IGNORE_DISTANCE = 0.60  # meters
+DEFAULT_TARGET_OBSTACLE_IGNORE_DISTANCE = 0.50  # meters
 INTERRUPT_RESUMED = "INTERRUPT_RESUMED"
 STATIC_AVOIDANCE_DONE = "STATIC_AVOIDANCE_DONE"
 INTERRUPT_FAILED = "INTERRUPT_FAILED"
@@ -199,6 +200,12 @@ class NavigationNode(Node):
             self.navigation_control_callback,
             10,
         )
+        self.mission_state_sub = self.create_subscription(
+            String,
+            "/mission/state",
+            self.mission_state_callback,
+            10,
+        )
 
         # Logical robot pose stored by the Pi.
         #
@@ -211,6 +218,7 @@ class NavigationNode(Node):
 
         # Latest ESP message.
         self.last_status = ""
+        self.latest_mission_state = ""
 
         # Response flags used while waiting for ESP.
         self.ack_received = False
@@ -436,6 +444,15 @@ class NavigationNode(Node):
             self.publish_navigation_status("STOPPED")
         elif command:
             self.get_logger().warn(f"Ignoring unknown navigation control: {command}")
+
+    def mission_state_callback(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.latest_mission_state = ""
+            return
+
+        self.latest_mission_state = data.get("mission_state", "")
 
     # -------------------------------------------------------------------------
     # BASIC COMMAND FUNCTIONS
@@ -1462,11 +1479,19 @@ class NavigationNode(Node):
 
     def close_to_active_target_during_move(self) -> bool:
         distance = self.estimated_current_distance_to_target_during_move()
+        threshold = self.current_target_obstacle_ignore_distance()
         self.get_logger().info(
             f"Near-target obstacle check: distance_to_target={distance:.3f} m, "
-            f"threshold={TARGET_OBSTACLE_IGNORE_DISTANCE:.3f} m"
+            f"threshold={threshold:.3f} m, "
+            f"mission_state={self.latest_mission_state}"
         )
-        return distance <= TARGET_OBSTACLE_IGNORE_DISTANCE
+        return distance <= threshold
+
+    def current_target_obstacle_ignore_distance(self) -> float:
+        if self.latest_mission_state == "headingToFruit":
+            return FRUIT_TARGET_OBSTACLE_IGNORE_DISTANCE
+
+        return DEFAULT_TARGET_OBSTACLE_IGNORE_DISTANCE
 
     def manhattan_commands(self, target_pose: Pose2D, axis_order: str = "XY") -> List[str]:
         """
