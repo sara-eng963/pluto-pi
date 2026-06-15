@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import asyncio
 import json
 import threading
@@ -233,13 +235,17 @@ class GuiNode(Node):
         msg_type = msg.get("type", "")
 
         # ── Gap 1: Teleop → /cmd_vel ──────────────────────────────────────
+        # Flutter sends integer flags: vx (-1/0/1), vy (-1/0/1), w (-1/0/1)
+        # The Pi drive node applies its own speed scaling.
         if msg_type == "teleop.command":
-            twist             = Twist()
-            twist.linear.x    = float(msg.get("linear",  0.0))
-            twist.angular.z   = float(msg.get("angular", 0.0))
+            twist           = Twist()
+            twist.linear.x  = float(msg.get("vx", 0))
+            twist.linear.y  = float(msg.get("vy", 0))
+            twist.angular.z = float(msg.get("w",  0))
             self.cmd_vel_pub.publish(twist)
             self.get_logger().info(
-                f"PUB /cmd_vel  lin={twist.linear.x:.3f}  ang={twist.angular.z:.3f}"
+                f"PUB /cmd_vel  dir={msg.get('direction','?')}  "
+                f"vx={int(twist.linear.x)}  vy={int(twist.linear.y)}  w={int(twist.angular.z)}"
             )
             return
 
