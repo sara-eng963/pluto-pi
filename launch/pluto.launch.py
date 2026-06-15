@@ -24,12 +24,12 @@ def generate_launch_description():
                 name="rfid_node",
                 output="screen",
             ),
-            Node(
-                package="pluto",
-                executable="gui_node.py",
-                name="gui_node",
-                output="screen",
-            ),
+          # Node(
+          #       package="pluto",
+          #       executable="gui_node.py",
+          #       name="gui_node",
+          #       output="screen",
+          #   ),
             ExecuteProcess(
                 cmd=[
                     "bash",
