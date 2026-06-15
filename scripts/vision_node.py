@@ -2,6 +2,7 @@
 
 import cv2
 import time
+import json
 import numpy as np
 
 import rclpy
@@ -39,6 +40,7 @@ class VisionNode(Node):
         self.confirm_required = 5
 
         self.ordered_fruit = ""
+        self.latest_mission_state = ""
 
         self.last_label = None
         self.confirm_count = 0
@@ -55,6 +57,12 @@ class VisionNode(Node):
             String,
             "/ordered_fruit",
             self.ordered_fruit_callback,
+            10
+        )
+        self.mission_state_sub = self.create_subscription(
+            String,
+            "/mission/state",
+            self.mission_state_callback,
             10
         )
 
@@ -147,6 +155,18 @@ class VisionNode(Node):
         self.valid = False
 
         self.get_logger().info(f"Received ordered fruit: {self.ordered_fruit}")
+
+    def mission_state_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
+            self.latest_mission_state = ""
+            return
+
+        self.latest_mission_state = data.get("mission_state", "")
+
+    def should_log_result(self) -> bool:
+        return self.latest_mission_state in ["visionChecking", "vision_checking"]
 
     def preprocess_roi(self, frame):
         roi = frame[
@@ -250,14 +270,15 @@ class VisionNode(Node):
         if elapsed >= 1.0:
             fps = self.frame_count / elapsed
 
-            self.get_logger().info(
-                f"FPS: {fps:.2f} | "
-                f"Order: {self.ordered_fruit if self.ordered_fruit else 'None'} | "
-                f"Current: {label} ({confidence:.3f}) | "
-                f"Confirmed: {self.detected_fruit} ({self.detected_confidence:.3f}) | "
-                f"Valid: {self.valid} | "
-                f"Count: {self.confirm_count}/{self.confirm_required}"
-            )
+            if self.should_log_result():
+                self.get_logger().info(
+                    f"FPS: {fps:.2f} | "
+                    f"Order: {self.ordered_fruit if self.ordered_fruit else 'None'} | "
+                    f"Current: {label} ({confidence:.3f}) | "
+                    f"Confirmed: {self.detected_fruit} ({self.detected_confidence:.3f}) | "
+                    f"Valid: {self.valid} | "
+                    f"Count: {self.confirm_count}/{self.confirm_required}"
+                )
 
             self.frame_count = 0
             self.start_time = time.time()
