@@ -15,6 +15,7 @@ class MissionNode(Node):
         super().__init__("mission_node")
 
         self.STATIC_CONFIRM_TIME = 4.0  # seconds
+        self.REQUIRED_VALID_READINGS = 3
 
         self.state = "CLEAR"
         self.latest_mask = 0
@@ -35,6 +36,8 @@ class MissionNode(Node):
         self.esp2_sequence_index = 0
         self.esp2_expected_status = None
         self.latest_valid = False
+        self.valid_reading_count = 0
+        self.valid_true_count = 0
         self.latest_detected_fruit = ""
         self.waiting_for_valid = False
         self.storage_done_for_current_target = False
@@ -534,6 +537,7 @@ class MissionNode(Node):
         self.fault_type = "none"
 
         self.waiting_for_valid = False
+        self._reset_valid_readings()
         self.storage_done_for_current_target = False
         self.waiting_for_rfid = False
         self.rfid_verified = False
@@ -558,37 +562,53 @@ class MissionNode(Node):
     def valid_callback(self, msg: Bool):
         self.latest_valid = msg.data
 
-        if not msg.data:
-            if (
-                self.waiting_for_valid
-                and self.mission_state == "visionChecking"
-                and not self.storage_sequence_running
-                and not self.storage_done_for_current_target
-            ):
-                self._handle_vision_fail()
+        if not (
+            self.waiting_for_valid
+            and self.mission_state == "visionChecking"
+            and not self.storage_sequence_running
+            and not self.storage_done_for_current_target
+        ):
             return
 
-        if (
-            self.waiting_for_valid
-            and (not self.storage_sequence_running)
-            and (not self.storage_done_for_current_target)
-        ):
-            if self.mission_state == "visionChecking":
-                self.mission_state = "storing"
-                self._publish_mission_state()
-                self._publish_mission_event(
-                    "storing",
-                    f"{self.active_fruit} validated. Starting storage sequence.",
-                    45,
-                )
-            self.get_logger().info("/valid became true. Starting storage sequence.")
+        self.valid_reading_count += 1
+        if msg.data:
+            self.valid_true_count += 1
+
+        self.get_logger().info(
+            f"Vision valid sample {self.valid_reading_count}/{self.REQUIRED_VALID_READINGS}: {msg.data}"
+        )
+
+        if self.valid_reading_count < self.REQUIRED_VALID_READINGS:
+            return
+
+        if self.valid_true_count == self.REQUIRED_VALID_READINGS:
+            self.mission_state = "storing"
+            self._publish_mission_state()
+            self._publish_mission_event(
+                "storing",
+                f"{self.active_fruit} validated after {self.REQUIRED_VALID_READINGS} readings. Starting storage sequence.",
+                45,
+            )
+            self.get_logger().info(
+                f"/valid true for {self.REQUIRED_VALID_READINGS} readings. Starting storage sequence."
+            )
             self.waiting_for_valid = False
+            self._reset_valid_readings()
             self.storage_done_for_current_target = True
             self._start_storage_sequence_thread()
             return
 
+        self.get_logger().warn(
+            f"Vision failed after {self.REQUIRED_VALID_READINGS} readings: {self.valid_true_count} true."
+        )
+        self._handle_vision_fail()
+
     def detected_fruit_callback(self, msg: String):
         self.latest_detected_fruit = msg.data.strip()
+
+    def _reset_valid_readings(self):
+        self.valid_reading_count = 0
+        self.valid_true_count = 0
 
     def _handle_vision_fail(self):
         detected = self.latest_detected_fruit or "Unknown"
@@ -597,6 +617,7 @@ class MissionNode(Node):
         )
 
         self.waiting_for_valid = False
+        self._reset_valid_readings()
         self.storage_done_for_current_target = False
 
         self._set_mission_state(
@@ -627,6 +648,7 @@ class MissionNode(Node):
             self.mission_state = "idle"
             self.fault_type = "missionCancelled"
             self.waiting_for_valid = False
+            self._reset_valid_readings()
             self.storage_done_for_current_target = False
             self.waiting_for_rfid = False
             self.rfid_verified = False
@@ -656,6 +678,7 @@ class MissionNode(Node):
             self.mission_state = "idle"
             self.fault_type = "none"
             self.waiting_for_valid = False
+            self._reset_valid_readings()
             self.storage_done_for_current_target = False
             self.waiting_for_rfid = False
             self.rfid_verified = False
@@ -700,6 +723,7 @@ class MissionNode(Node):
                     self.mission_state = "idle"
                     self.fault_type = "modeSwitchedToManual"
                     self.waiting_for_valid = False
+                    self._reset_valid_readings()
                     self.storage_done_for_current_target = False
                     self.waiting_for_rfid = False
                     self.rfid_verified = False
@@ -781,24 +805,11 @@ class MissionNode(Node):
             )
 
             self.waiting_for_valid = True
+            self._reset_valid_readings()
             self.storage_done_for_current_target = False
-            self.get_logger().info("Reached fruit target. Waiting for /valid = true.")
-
-            if self.latest_valid:
-                if (not self.storage_sequence_running) and (not self.storage_done_for_current_target):
-                    self.get_logger().info("/valid already true at NAV_DONE. Starting storage sequence.")
-
-                    self.mission_state = "storing"
-                    self._publish_mission_state()
-                    self._publish_mission_event(
-                        "storing",
-                        f"{self.active_fruit} validated. Starting storage sequence.",
-                        45,
-                    )
-
-                    self.waiting_for_valid = False
-                    self.storage_done_for_current_target = True
-                    self._start_storage_sequence_thread()
+            self.get_logger().info(
+                f"Reached fruit target. Waiting for {self.REQUIRED_VALID_READINGS} fresh /valid readings."
+            )
 
         # Case 2: robot reached customer pose, which is HOME = 0,0,0
         if self.mission_state == "headingToCustomer":
@@ -829,6 +840,7 @@ class MissionNode(Node):
             self.assigned_rfid = ""
             self.fault_type = "visionFailed"
             self.waiting_for_valid = False
+            self._reset_valid_readings()
             self.storage_done_for_current_target = False
             self.waiting_for_rfid = False
             self.rfid_verified = False
@@ -1031,6 +1043,7 @@ class MissionNode(Node):
         self.latest_valid = False
         self.latest_detected_fruit = ""
         self.waiting_for_valid = False
+        self._reset_valid_readings()
         self.storage_done_for_current_target = False
 
 
