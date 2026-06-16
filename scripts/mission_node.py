@@ -351,7 +351,8 @@ class MissionNode(Node):
         self.destroy_timer(self.startup_default_timer)
         self.startup_default_timer = None
 
-        self.get_logger().info("Setting startup storage defaults: close lid, gripper open.")
+        self.get_logger().info("Setting startup storage defaults: open lock, close lid, gripper open.")
+        self._send_gripper_cmd("open_lock")
         self._send_gripper_cmd("close_lid")
         self._send_gripper_cmd("open_gripper")
 
@@ -498,7 +499,6 @@ class MissionNode(Node):
             "customer_close",
             [
                 self._storage_step("gripper", "close_lid", "closed lid"),
-                self._storage_step("gripper", "close_lock", "closed lock"),
             ],
         )
 
@@ -515,7 +515,6 @@ class MissionNode(Node):
                 self._storage_step("gripper", "open_gripper", "opened gripper"),
                 self._storage_step("position", 0, "position 0 reached"),
                 self._storage_step("gripper", "close_lid", "closed lid"),
-                self._storage_step("gripper", "close_lock", "closed lock"),
             ],
         )
 
@@ -906,6 +905,7 @@ class MissionNode(Node):
             self.waiting_for_rfid = False
             self.mission_state = "failed"
             self.fault_type = "rfidFailed"
+            self._send_gripper_cmd("close_lock")
 
             self._publish_mission_state()
             self._publish_mission_event(

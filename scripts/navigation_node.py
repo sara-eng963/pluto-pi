@@ -514,7 +514,7 @@ class NavigationNode(Node):
 
     def cmd_vel_callback(self, msg: Twist):
         """
-        Forward GUI joystick commands to ESP1 as MANUAL vx,vy,wz.
+        Forward GUI joystick commands to ESP1 as MANUAL vx vy wz.
 
         Only active in manual mode. Each component is reduced to a sign:
             +1  (positive)
@@ -522,8 +522,8 @@ class NavigationNode(Node):
             -1  (negative)
 
         ESP1 expected format:
-            MANUAL vx,vy,wz
-        e.g.  MANUAL 1,0,0   MANUAL 0,0,-1   MANUAL 0,0,0
+            MANUAL vx vy wz
+        e.g.  MANUAL 1 0 0   MANUAL 0 0 -1   MANUAL 0 0 0
         """
         if self.robot_mode != "manual":
             return
@@ -539,7 +539,7 @@ class NavigationNode(Node):
         vy = _sign(msg.linear.y)
         wz = _sign(msg.angular.z)
 
-        command = f"MANUAL {vx},{vy},{wz}"
+        command = f"MANUAL {vx} {vy} {wz}"
         drive_msg = String()
         drive_msg.data = command
         self.cmd_pub.publish(drive_msg)

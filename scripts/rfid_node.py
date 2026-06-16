@@ -318,7 +318,6 @@ class RFIDNode(Node):
         self.last_uid = ""
         self.last_publish_time = 0.0
         self.poll_count = 0
-        self.no_uid_count = 0
 
         period = 1.0 / max(self.poll_hz, 0.1)
         self.timer = self.create_timer(period, self.poll_once)
@@ -352,16 +351,8 @@ class RFIDNode(Node):
             return
 
         if uid is None:
-            self.no_uid_count += 1
-            if self.no_uid_count % max(int(self.poll_hz * 5.0), 1) == 0:
-                version = self.reader.read_version()
-                self.get_logger().info(
-                    f"RFID polling: no UID detected after {self.no_uid_count} empty polls. "
-                    f"VersionReg=0x{version:02X}"
-                )
             return
 
-        self.no_uid_count = 0
         uid_text = self.format_uid(uid)
         now = time.monotonic()
 
