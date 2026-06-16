@@ -79,6 +79,7 @@ from std_msgs.msg import String
 
 STATIC_AVOIDANCE_DISTANCE = 0.50
 MAX_STATIC_AVOIDANCE_ATTEMPTS = 3
+FRUIT_EXIT_BACKUP_DISTANCE = 0.25
 FRUIT_TARGET_OBSTACLE_IGNORE_DISTANCE = 0.85  # meters
 DEFAULT_TARGET_OBSTACLE_IGNORE_DISTANCE = 0.50  # meters
 INTERRUPT_RESUMED = "INTERRUPT_RESUMED"
@@ -220,6 +221,7 @@ class NavigationNode(Node):
         # Latest ESP message.
         self.last_status = ""
         self.latest_mission_state = ""
+        self.fruit_exit_backup_pending = False
 
         # Response flags used while waiting for ESP.
         self.ack_received = False
@@ -977,6 +979,42 @@ class NavigationNode(Node):
 
         return result
 
+    def execute_fruit_exit_backup(self) -> bool:
+        yaw = self.normalize_yaw_deg(self.current_pose.yaw)
+        command = f"MOVE {-FRUIT_EXIT_BACKUP_DISTANCE:.2f} {yaw:.0f}"
+
+        self.get_logger().info(f"Executing fruit exit backup: {command}")
+
+        self.set_obstacle_ignore_zone(False, force=True)
+        self.current_executing_command = command
+        self.current_move_start_pose = Pose2D(
+            self.current_pose.x,
+            self.current_pose.y,
+            self.current_pose.yaw,
+        )
+        self.command_active = True
+
+        result = self.send_command_and_wait(command)
+
+        if result == "DONE":
+            self.update_pose_after_successful_command(
+                command,
+                context="fruit-exit-backup",
+            )
+            self.command_active = False
+            self.set_obstacle_ignore_zone(False, force=True)
+            self.fruit_exit_backup_pending = False
+            self.get_logger().info(
+                "Fruit exit backup completed; continuing normal Manhattan navigation."
+            )
+            return True
+
+        self.get_logger().error("Fruit exit backup failed. Sending STOP.")
+        self.send_stop()
+        self.command_active = False
+        self.set_obstacle_ignore_zone(False, force=True)
+        return False
+
     # -------------------------------------------------------------------------
     # OBSTACLE HANDLING
     # -------------------------------------------------------------------------
@@ -1705,6 +1743,14 @@ class NavigationNode(Node):
 
         self.navigation_active = True
 
+        if self.fruit_exit_backup_pending:
+            if not self.execute_fruit_exit_backup():
+                self.navigation_active = False
+                self.active_target_pose = None
+                self.static_avoidance_count = 0
+                self.next_axis_order = "XY"
+                return False
+
         commands = self.manhattan_commands(
             normalized_target,
             axis_order=self.next_axis_order,
@@ -1938,6 +1984,10 @@ def execute_navigation_request(node: NavigationNode, target_pose: Pose2D) -> boo
     success = node.execute_navigation_to(target_pose)
 
     if success:
+        if node.latest_mission_state == "headingToFruit":
+            node.fruit_exit_backup_pending = True
+            node.get_logger().info("Fruit exit backup armed after reaching fruit.")
+
         node.publish_current_pose()
         node.publish_navigation_result("NAV_DONE", target_pose)
         node.publish_navigation_status("COMPLETED", target_pose=target_pose)
