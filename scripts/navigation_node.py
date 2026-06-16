@@ -222,6 +222,7 @@ class NavigationNode(Node):
         self.last_status = ""
         self.latest_mission_state = ""
         self.fruit_exit_backup_pending = False
+        self.fruit_exit_backup_active = False
 
         # Response flags used while waiting for ESP.
         self.ack_received = False
@@ -370,6 +371,12 @@ class NavigationNode(Node):
         """
 
         event = msg.data.strip()
+
+        if self.fruit_exit_backup_active:
+            self.get_logger().info(
+                f"Ignoring obstacle event during fruit exit backup: {event}"
+            )
+            return
 
         if self.static_avoidance_active:
             self.get_logger().info(
@@ -993,27 +1000,31 @@ class NavigationNode(Node):
             self.current_pose.yaw,
         )
         self.command_active = True
+        self.fruit_exit_backup_active = True
 
-        result = self.send_command_and_wait(command)
+        try:
+            result = self.send_command_and_wait(command)
 
-        if result == "DONE":
-            self.update_pose_after_successful_command(
-                command,
-                context="fruit-exit-backup",
-            )
+            if result == "DONE":
+                self.update_pose_after_successful_command(
+                    command,
+                    context="fruit-exit-backup",
+                )
+                self.command_active = False
+                self.set_obstacle_ignore_zone(False, force=True)
+                self.fruit_exit_backup_pending = False
+                self.get_logger().info(
+                    "Fruit exit backup completed; continuing normal Manhattan navigation."
+                )
+                return True
+
+            self.get_logger().error("Fruit exit backup failed. Sending STOP.")
+            self.send_stop()
             self.command_active = False
             self.set_obstacle_ignore_zone(False, force=True)
-            self.fruit_exit_backup_pending = False
-            self.get_logger().info(
-                "Fruit exit backup completed; continuing normal Manhattan navigation."
-            )
-            return True
-
-        self.get_logger().error("Fruit exit backup failed. Sending STOP.")
-        self.send_stop()
-        self.command_active = False
-        self.set_obstacle_ignore_zone(False, force=True)
-        return False
+            return False
+        finally:
+            self.fruit_exit_backup_active = False
 
     # -------------------------------------------------------------------------
     # OBSTACLE HANDLING

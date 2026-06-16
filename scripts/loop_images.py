@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import socket
 import time
 from pathlib import Path
 
@@ -110,9 +109,8 @@ def main():
         cap.release()
         print("Camera released.")
 
-    host = socket.gethostname()
     print("\nTo copy these images from your laptop, run something like:")
-    print(f"scp -r pi@{host}:{output_dir.resolve()} .")
+    print(f"scp -r pluto@172.20.10.2:{output_dir.resolve()} .")
 
 
 if __name__ == "__main__":

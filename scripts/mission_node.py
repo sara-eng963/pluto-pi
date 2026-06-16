@@ -809,6 +809,7 @@ class MissionNode(Node):
             self.get_logger().info(
                 f"Reached fruit target. Waiting for {self.REQUIRED_VALID_READINGS} fresh /valid readings."
             )
+            return
 
         # Case 2: robot reached customer pose, which is HOME = 0,0,0
         if self.mission_state == "headingToCustomer":
