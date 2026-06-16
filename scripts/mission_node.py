@@ -64,6 +64,10 @@ class MissionNode(Node):
         self.fault_type = "none"
 
         self.storage_sequence_running = False
+        self.esp2_sequence_name = None
+        self.esp2_sequence_steps = []
+        self.esp2_sequence_index = 0
+        self.esp2_expected_status = None
         self.latest_valid = False
         self.waiting_for_valid = False
         self.storage_done_for_current_target = False
@@ -122,6 +126,12 @@ class MissionNode(Node):
         self.esp2_position_pub = self.create_publisher(
             Int32,
             "/esp2/position_cmd",
+            10,
+        )
+        self.esp2_status_sub = self.create_subscription(
+            String,
+            "/esp2_status",
+            self.esp2_status_callback,
             10,
         )
 
@@ -375,107 +385,150 @@ class MissionNode(Node):
 
         return x, y, yaw
 
-    def _open_storage_for_customer(self):
-        self.get_logger().info("Opening storage for customer.")
+    def _cancel_esp2_sequence(self):
+        self.storage_sequence_running = False
+        self.esp2_sequence_name = None
+        self.esp2_sequence_steps = []
+        self.esp2_sequence_index = 0
+        self.esp2_expected_status = None
 
-        self._send_gripper_cmd("open_lock")
-        time.sleep(1.0)
-
-        self._send_gripper_cmd("open_lid")
-        time.sleep(1.0)
-
-        self.get_logger().info("Storage opened for customer.")
-
-
-    def _start_open_storage_thread(self):
-        threading.Thread(
-            target=self._open_storage_for_customer,
-            daemon=True,
-        ).start()
-
-
-    def _close_storage_after_customer(self):
-        self.get_logger().info("Closing storage after customer collection.")
-
-        self._send_gripper_cmd("close_lid")
-        time.sleep(1.0)
-
-        self._send_gripper_cmd("close_lock")
-        time.sleep(1.0)
-
-        self.get_logger().info("Storage closed after customer collection.")
-
-        # Customer pose is HOME, so after closing storage the mission is complete.
-        self._finish_mission_to_idle()
-
-
-    def _start_close_storage_thread(self):
-        threading.Thread(
-            target=self._close_storage_after_customer,
-            daemon=True,
-        ).start()
-        
-    def run_storage_sequence(self):
+    def _start_esp2_sequence(self, name: str, steps: list):
         if self.storage_sequence_running:
-            self.get_logger().warn("Storage sequence already running. Ignoring duplicate request.")
-            return
+            self.get_logger().warn(
+                f"ESP2 sequence already running ({self.esp2_sequence_name}). Ignoring {name} request."
+            )
+            return False
 
         self.storage_sequence_running = True
-        self.get_logger().info("Starting storage sequence.")
+        self.esp2_sequence_name = name
+        self.esp2_sequence_steps = steps
+        self.esp2_sequence_index = 0
+        self.esp2_expected_status = None
 
-        self._send_gripper_cmd("open_lock")
-        time.sleep(1.0)
+        self.get_logger().info(f"Starting ESP2 sequence: {name}")
+        self._send_current_esp2_sequence_step()
+        return True
 
-        self._send_gripper_cmd("open_gripper")
-        time.sleep(1.5)
+    def _send_current_esp2_sequence_step(self):
+        if not self.storage_sequence_running:
+            return
 
-        self._send_gripper_cmd("close_gripper")
-        time.sleep(1.5)
+        if self.esp2_sequence_index >= len(self.esp2_sequence_steps):
+            self._complete_esp2_sequence()
+            return
 
-        self._send_gripper_cmd("open_lid")
-        time.sleep(1.0)
+        step = self.esp2_sequence_steps[self.esp2_sequence_index]
+        self.esp2_expected_status = step["expected_status"]
 
-        self._send_position_cmd(90)
-        time.sleep(4.0)
+        if step["command_type"] == "gripper":
+            self._send_gripper_cmd(step["command_value"])
+        elif step["command_type"] == "position":
+            self._send_position_cmd(step["command_value"])
+        else:
+            self.get_logger().error(f"Invalid ESP2 sequence command type: {step['command_type']}")
+            self._cancel_esp2_sequence()
 
-        self._send_gripper_cmd("open_gripper")
-        time.sleep(1.5)
+    def esp2_status_callback(self, msg: String):
+        status = msg.data.strip()
+        self.get_logger().info(f"RX /esp2_status: {status}")
 
-        self._send_position_cmd(0)
-        time.sleep(4.0)
+        if not self.storage_sequence_running:
+            return
 
-        self._send_gripper_cmd("close_lid")
-        time.sleep(1.0)
+        if status != self.esp2_expected_status:
+            return
 
-        self._send_gripper_cmd("close_lock")
-        time.sleep(1.0)
+        self.esp2_sequence_index += 1
+        self._send_current_esp2_sequence_step()
 
-        self.storage_sequence_running = False
-        self.get_logger().info("Fruit pickup storage sequence complete.")
+    def _complete_esp2_sequence(self):
+        sequence_name = self.esp2_sequence_name
+        self._cancel_esp2_sequence()
 
-        if self.mission_state == "storing":
-            self._publish_mission_event(
-                "storing",
-                "Fruit collected and placed in storage.",
-                50,
-            )
+        if sequence_name == "fruit_pickup_storage":
+            self.get_logger().info("Fruit pickup storage sequence complete.")
 
-            # Customer pose is HOME: x=0, y=0, yaw=0
+            if self.mission_state == "storing":
+                self._publish_mission_event(
+                    "storing",
+                    "Fruit collected and placed in storage.",
+                    50,
+                )
+
+                # Customer pose is HOME: x=0, y=0, yaw=0
+                self._set_mission_state(
+                    "headingToCustomer",
+                    "headingToCustomer",
+                    "Robot heading to customer location.",
+                    55,
+                )
+
+                x, y, theta = self.customer_pose
+                self._publish_navigation_goal(x, y, theta)
+
+        elif sequence_name == "customer_open":
+            self.get_logger().info("Storage opened for customer.")
+            self.waiting_for_storage_close = True
+
             self._set_mission_state(
-                "headingToCustomer",
-                "headingToCustomer",
-                "Robot heading to customer location.",
-                55,
+                "storageOpened",
+                "storageOpened",
+                "RFID verified. Storage opened for customer.",
+                80,
             )
 
-            x, y, theta = self.customer_pose
-            self._publish_navigation_goal(x, y, theta)
+        elif sequence_name == "customer_close":
+            self.get_logger().info("Storage closed after customer collection.")
+
+            # Customer pose is HOME, so after closing storage the mission is complete.
+            self._finish_mission_to_idle()
+
+    def _storage_step(self, command_type: str, command_value, expected_status: str):
+        return {
+            "command_type": command_type,
+            "command_value": command_value,
+            "expected_status": expected_status,
+        }
+
+    def _start_open_storage_thread(self):
+        self.get_logger().info("Opening storage for customer.")
+        self._start_esp2_sequence(
+            "customer_open",
+            [
+                self._storage_step("gripper", "open_lock", "opened lock"),
+                self._storage_step("gripper", "open_lid", "opened lid"),
+            ],
+        )
+
+    def _start_close_storage_thread(self):
+        self.get_logger().info("Closing storage after customer collection.")
+        self._start_esp2_sequence(
+            "customer_close",
+            [
+                self._storage_step("gripper", "close_lid", "closed lid"),
+                self._storage_step("gripper", "close_lock", "closed lock"),
+            ],
+        )
+
+    def run_storage_sequence(self):
+        self.get_logger().info("Starting storage sequence.")
+        self._start_esp2_sequence(
+            "fruit_pickup_storage",
+            [
+                self._storage_step("gripper", "open_lock", "opened lock"),
+                self._storage_step("gripper", "open_gripper", "opened gripper"),
+                self._storage_step("gripper", "close_gripper", "closed gripper"),
+                self._storage_step("gripper", "open_lid", "opened lid"),
+                self._storage_step("position", 90, "position 90 reached"),
+                self._storage_step("gripper", "open_gripper", "opened gripper"),
+                self._storage_step("position", 0, "position 0 reached"),
+                self._storage_step("gripper", "close_lid", "closed lid"),
+                self._storage_step("gripper", "close_lock", "closed lock"),
+            ],
+        )
 
     def _start_storage_sequence_thread(self):
-        threading.Thread(
-            target=self.run_storage_sequence,
-            daemon=True,
-        ).start()
+        self.run_storage_sequence()
 
     def _finish_mission_to_idle(self):
         self._publish_mission_event(
@@ -549,6 +602,7 @@ class MissionNode(Node):
         if command == "STOP":
             self.get_logger().warn("Mission STOP requested.")
             self._publish_navigation_control("STOP")
+            self._cancel_esp2_sequence()
 
             self.mission_state = "idle"
             self.fault_type = "missionCancelled"
@@ -575,6 +629,7 @@ class MissionNode(Node):
         if command == "RESET":
             self.get_logger().warn("Mission RESET requested.")
             self.reset_obstacle_state()
+            self._cancel_esp2_sequence()
 
             self.mission_state = "idle"
             self.fault_type = "none"
@@ -734,14 +789,6 @@ class MissionNode(Node):
 
         self.waiting_for_rfid = False
         self.rfid_verified = True
-        self.waiting_for_storage_close = True
-
-        self._set_mission_state(
-            "storageOpened",
-            "storageOpened",
-            "RFID verified. Storage opened for customer.",
-            80,
-        )
 
         self._start_open_storage_thread()
 
