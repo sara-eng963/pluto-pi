@@ -70,6 +70,7 @@ from typing import List, Union
 
 import rclpy
 from geometry_msgs.msg import Pose2D as RosPose2D
+from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from std_msgs.msg import Bool
 from std_msgs.msg import Float32
@@ -274,6 +275,24 @@ class NavigationNode(Node):
             10,
         )
 
+        # ---- Manual / autonomous mode ---------------------------------------
+        self.robot_mode = "autonomous"   # "autonomous" | "manual"
+        self.manual_mode_interrupt = False
+
+        self.robot_mode_sub = self.create_subscription(
+            String,
+            "/robot/mode",
+            self.robot_mode_callback,
+            10,
+        )
+        self.cmd_vel_sub = self.create_subscription(
+            Twist,
+            "/cmd_vel",
+            self.cmd_vel_callback,
+            10,
+        )
+        # ---------------------------------------------------------------------
+
         self.debug_yaw_timer = self.create_timer(
             1.0,
             self.request_debug_yaw_status,
@@ -454,9 +473,79 @@ class NavigationNode(Node):
 
         self.latest_mission_state = data.get("mission_state", "")
 
-    # -------------------------------------------------------------------------
-    # BASIC COMMAND FUNCTIONS
-    # -------------------------------------------------------------------------
+    def robot_mode_callback(self, msg: String):
+        """
+        Handle /robot/mode changes published by mission_node.
+
+        On "manual":
+            - Set manual_mode_interrupt so all blocking wait loops exit immediately.
+            - Send STOP to ESP so the robot halts.
+            - Drain any queued autonomous goals.
+
+        On "autonomous":
+            - Clear manual_mode_interrupt so the navigation loop can run again.
+        """
+        mode = msg.data.strip().lower()
+        if mode not in ("manual", "autonomous"):
+            return
+
+        if self.robot_mode == mode:
+            return
+
+        self.robot_mode = mode
+        self.get_logger().warn(f"Navigation: robot mode → {mode}")
+
+        if mode == "manual":
+            self.manual_mode_interrupt = True
+            self.send_stop()
+            self.navigation_active = False
+            self.command_active = False
+            self.set_obstacle_ignore_zone(False, force=True)
+            # Drain all queued autonomous goals.
+            while not self.goal_queue.empty():
+                try:
+                    self.goal_queue.get_nowait()
+                except Exception:
+                    break
+            self.get_logger().info("Manual mode active. Awaiting /cmd_vel commands.")
+        else:
+            self.manual_mode_interrupt = False
+            self.get_logger().info("Autonomous mode active. Ready for navigation goals.")
+
+    def cmd_vel_callback(self, msg: Twist):
+        """
+        Forward GUI joystick commands to ESP1 as MANUAL vx,vy,wz.
+
+        Only active in manual mode. Each component is reduced to a sign:
+            +1  (positive)
+             0  (zero)
+            -1  (negative)
+
+        ESP1 expected format:
+            MANUAL vx,vy,wz
+        e.g.  MANUAL 1,0,0   MANUAL 0,0,-1   MANUAL 0,0,0
+        """
+        if self.robot_mode != "manual":
+            return
+
+        def _sign(v: float) -> int:
+            if v > 0.0:
+                return 1
+            if v < 0.0:
+                return -1
+            return 0
+
+        vx = _sign(msg.linear.x)
+        vy = _sign(msg.linear.y)
+        wz = _sign(msg.angular.z)
+
+        command = f"MANUAL {vx},{vy},{wz}"
+        drive_msg = String()
+        drive_msg.data = command
+        self.cmd_pub.publish(drive_msg)
+        self.get_logger().info(f"MANUAL CMD: {command}")
+
+
 
     def reset_wait_flags(self):
         """
@@ -708,6 +797,10 @@ class NavigationNode(Node):
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.01)
 
+            if self.manual_mode_interrupt:
+                self.get_logger().warn("wait_for_ack: manual mode interrupt — aborting.")
+                return False
+
             if self.ack_received:
                 return True
 
@@ -798,6 +891,10 @@ class NavigationNode(Node):
             if now - last_ignore_zone_refresh >= 0.2:
                 self.refresh_obstacle_ignore_zone()
                 last_ignore_zone_refresh = now
+
+            if self.manual_mode_interrupt:
+                self.get_logger().warn("wait_for_done: manual mode interrupt — aborting.")
+                return "FAILED"
 
             if self.interrupt_requested and not self.static_avoidance_active:
                 return "INTERRUPTED"
@@ -1092,6 +1189,10 @@ class NavigationNode(Node):
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.01)
+
+            if self.manual_mode_interrupt:
+                self.get_logger().warn("wait_for_dynamic_clear_or_static: manual mode interrupt — aborting.")
+                return "STATIC"
 
             if self.static_blocked:
                 return "STATIC"
@@ -1913,7 +2014,12 @@ def main(args=None):
                 queued_goal = None
 
             if queued_goal is not None:
-                execute_navigation_request(node, queued_goal)
+                if node.robot_mode == "manual":
+                    node.get_logger().warn(
+                        "Discarding queued goal: robot is in manual mode."
+                    )
+                else:
+                    execute_navigation_request(node, queued_goal)
                 continue
 
             try:

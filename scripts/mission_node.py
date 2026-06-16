@@ -1,39 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-mission_node.py
-
-Current version:
-    Obstacle logic only.
-
-Purpose:
-    - Subscribe to /obstacle_status from ESP2
-    - Detect dynamic obstacle clearing
-    - Detect static obstacle locking
-    - Support obstacle reset using:
-        1. terminal input: c
-        2. ROS topic: /mission_reset_obstacle
-
-ESP2 publishes:
-    /obstacle_status
-    std_msgs/msg/Int32
-
-Mask:
-    0 = clear
-    1 = left blocked
-    2 = front blocked
-    3 = left + front blocked
-    4 = right blocked
-    5 = left + right blocked
-    6 = front + right blocked
-    7 = left + front + right blocked
-
-States:
-    CLEAR
-    WAITING_FOR_CLEAR
-    STATIC_LOCKED
-"""
-
 import time
 import threading
 import json
@@ -69,13 +35,19 @@ class MissionNode(Node):
         self.esp2_sequence_index = 0
         self.esp2_expected_status = None
         self.latest_valid = False
+        self.latest_detected_fruit = ""
         self.waiting_for_valid = False
         self.storage_done_for_current_target = False
+
+        self.RFID_MAX_ATTEMPTS = 3
+        self.rfid_failed_attempts = 0
 
         self.waiting_for_rfid = False
         self.rfid_verified = False
         self.waiting_for_storage_close = False
         self.navigation_obstacle_ignore_zone = False
+
+        self.robot_mode = "autonomous"  # "autonomous" | "manual"
 
         # Customer pose is HOME for this project
         self.customer_pose = (0.0, 0.0, 0.0)
@@ -84,8 +56,8 @@ class MissionNode(Node):
         # Later move these to YAML parameters.
         self.fruit_poses = {
             "Apple": (0.8, 0.0, 0.0),
-            "Orange": (0.5, 0.5, 90.0),
-            "Kiwi": (0.0, 0.5, 90.0),
+            "Orange": (0.8, 0.8, 0),
+            "Kiwi": (0.8, 1.4, 0),
         }
 
         self.obstacle_sub = self.create_subscription(
@@ -148,6 +120,12 @@ class MissionNode(Node):
             self.valid_callback,
             10,
         )
+        self.detected_fruit_sub = self.create_subscription(
+            String,
+            "/detected_fruit",
+            self.detected_fruit_callback,
+            10,
+        )
         self.order_request_sub = self.create_subscription(
             String,
             "/mission/order_request",
@@ -206,7 +184,17 @@ class MissionNode(Node):
             10,
         )
 
+        self.robot_mode_pub = self.create_publisher(
+            String,
+            "/robot/mode",
+            10,
+        )
+
         self.current_traffic = None
+        self.startup_default_timer = self.create_timer(
+            1.0,
+            self._send_startup_default_storage_position,
+        )
 
         self.get_logger().info("Mission node started.")
         self.get_logger().info("Obstacle logic active.")
@@ -320,7 +308,7 @@ class MissionNode(Node):
     def _should_ignore_obstacle_near_target(self) -> bool:
         return (
             self.navigation_obstacle_ignore_zone
-            and self.mission_state in ["headingToFruit", "headingToCustomer"]
+            and self.mission_state in ["headingToFruit", "headingToCustomer", "visionFailedReturning"]
         ) or self.mission_state in ["visionChecking", "storing"]
 
     def reset_obstacle_state(self):
@@ -354,6 +342,15 @@ class MissionNode(Node):
         msg.data = command
         self.esp2_gripper_pub.publish(msg)
         self.get_logger().info(f"PUB /esp2/gripper_cmd: {command}")
+
+    def _send_startup_default_storage_position(self):
+        self.startup_default_timer.cancel()
+        self.destroy_timer(self.startup_default_timer)
+        self.startup_default_timer = None
+
+        self.get_logger().info("Setting startup storage defaults: close lid, gripper open.")
+        self._send_gripper_cmd("close_lid")
+        self._send_gripper_cmd("open_gripper")
 
     def _send_position_cmd(self, position: int):
         msg = Int32()
@@ -467,15 +464,7 @@ class MissionNode(Node):
                 self._publish_navigation_goal(x, y, theta)
 
         elif sequence_name == "customer_open":
-            self.get_logger().info("Storage opened for customer.")
-            self.waiting_for_storage_close = True
-
-            self._set_mission_state(
-                "storageOpened",
-                "storageOpened",
-                "RFID verified. Storage opened for customer.",
-                80,
-            )
+            self.get_logger().info("Storage opened for customer (mechanism complete).")
 
         elif sequence_name == "customer_close":
             self.get_logger().info("Storage closed after customer collection.")
@@ -549,6 +538,8 @@ class MissionNode(Node):
         self.waiting_for_rfid = False
         self.rfid_verified = False
         self.waiting_for_storage_close = False
+        self.rfid_failed_attempts = 0
+        self.latest_detected_fruit = ""
 
         self._publish_mission_state()
 
@@ -568,6 +559,13 @@ class MissionNode(Node):
         self.latest_valid = msg.data
 
         if not msg.data:
+            if (
+                self.waiting_for_valid
+                and self.mission_state == "visionChecking"
+                and not self.storage_sequence_running
+                and not self.storage_done_for_current_target
+            ):
+                self._handle_vision_fail()
             return
 
         if (
@@ -588,6 +586,28 @@ class MissionNode(Node):
             self.storage_done_for_current_target = True
             self._start_storage_sequence_thread()
             return
+
+    def detected_fruit_callback(self, msg: String):
+        self.latest_detected_fruit = msg.data.strip()
+
+    def _handle_vision_fail(self):
+        detected = self.latest_detected_fruit or "Unknown"
+        self.get_logger().warn(
+            f"Vision FAIL: ordered={self.active_fruit}, detected={detected}. Returning to base."
+        )
+
+        self.waiting_for_valid = False
+        self.storage_done_for_current_target = False
+
+        self._set_mission_state(
+            "visionFailedReturning",
+            "visionFailed",
+            f"Vision check failed: expected {self.active_fruit}, detected {detected}. Returning to base.",
+            25,
+        )
+
+        x, y, theta = self.customer_pose
+        self._publish_navigation_goal(x, y, theta)
 
     def mission_control_callback(self, msg: String):
         self.get_logger().info(f"RX /mission/control: {msg.data}")
@@ -616,6 +636,8 @@ class MissionNode(Node):
             self.active_user_id = ""
             self.assigned_rfid = ""
             self.latest_valid = False
+            self.latest_detected_fruit = ""
+            self.rfid_failed_attempts = 0
 
             self._set_traffic("O")
             self._publish_mission_state()
@@ -643,6 +665,8 @@ class MissionNode(Node):
             self.assigned_rfid = ""
             self.active_fruit = ""
             self.latest_valid = False
+            self.latest_detected_fruit = ""
+            self.rfid_failed_attempts = 0
 
             self._set_traffic("Y")
             self._publish_mission_state()
@@ -653,7 +677,59 @@ class MissionNode(Node):
             )
             return
 
+        if command == "SET_MODE":
+            mode = str(data.get("mode", "autonomous")).lower()
+            if mode not in ("manual", "autonomous"):
+                self.get_logger().warn(f"Unknown mode in SET_MODE: {mode}")
+                return
+
+            if self.robot_mode == mode:
+                self.get_logger().info(f"Robot already in mode: {mode}")
+                self._publish_robot_mode()
+                return
+
+            self.robot_mode = mode
+            self.get_logger().warn(f"Robot mode → {mode}")
+
+            if mode == "manual":
+                # Abort any active mission cleanly.
+                if self.mission_state != "idle":
+                    self._publish_navigation_control("STOP")
+                    self._cancel_esp2_sequence()
+
+                    self.mission_state = "idle"
+                    self.fault_type = "modeSwitchedToManual"
+                    self.waiting_for_valid = False
+                    self.storage_done_for_current_target = False
+                    self.waiting_for_rfid = False
+                    self.rfid_verified = False
+                    self.waiting_for_storage_close = False
+                    self.active_order_id = ""
+                    self.active_fruit = ""
+                    self.active_user_id = ""
+                    self.assigned_rfid = ""
+                    self.latest_valid = False
+                    self.latest_detected_fruit = ""
+                    self.rfid_failed_attempts = 0
+
+                    self._set_traffic("O")
+                    self._publish_mission_state()
+                    self._publish_mission_event(
+                        "missionAborted",
+                        "Mission aborted: switched to manual control.",
+                        0,
+                    )
+
+            self._publish_robot_mode()
+            return
+
         self.get_logger().warn(f"Unknown mission control command: {command}")
+
+    def _publish_robot_mode(self):
+        msg = String()
+        msg.data = self.robot_mode
+        self.robot_mode_pub.publish(msg)
+        self.get_logger().info(f"PUB /robot/mode: {self.robot_mode}")
 
     def navigation_result_callback(self, msg: String):
         text = msg.data.strip()
@@ -672,7 +748,7 @@ class MissionNode(Node):
 
             # Only navigation states are allowed to fail the mission.
             # Ignore stale NAV_FAILED after robot already reached customer / opened storage.
-            if self.mission_state in ["headingToFruit", "headingToCustomer"]:
+            if self.mission_state in ["headingToFruit", "headingToCustomer", "visionFailedReturning"]:
                 self.mission_state = "failed"
                 self.fault_type = "navigationFailed"
                 self._publish_mission_state()
@@ -728,6 +804,7 @@ class MissionNode(Node):
         if self.mission_state == "headingToCustomer":
             self.waiting_for_rfid = True
             self.rfid_verified = False
+            self.rfid_failed_attempts = 0
 
             self._set_mission_state(
                 "rfidAwaiting",
@@ -735,6 +812,30 @@ class MissionNode(Node):
                 "Robot reached customer. Waiting for RFID verification.",
                 70,
             )
+            return
+
+        # Case 3: robot returned home after vision fail — no RFID, no storage, straight to idle
+        if self.mission_state == "visionFailedReturning":
+            self.get_logger().info("Returned to base after vision fail. Ready for new orders.")
+            self._publish_mission_event(
+                "visionFailedIdle",
+                f"Vision check failed. Robot returned to base. Ready for new orders.",
+                0,
+            )
+            self.mission_state = "idle"
+            self.active_order_id = ""
+            self.active_fruit = ""
+            self.active_user_id = ""
+            self.assigned_rfid = ""
+            self.fault_type = "visionFailed"
+            self.waiting_for_valid = False
+            self.storage_done_for_current_target = False
+            self.waiting_for_rfid = False
+            self.rfid_verified = False
+            self.waiting_for_storage_close = False
+            self.rfid_failed_attempts = 0
+            self.latest_detected_fruit = ""
+            self._publish_mission_state()
             return
 
         # Any other NAV_DONE is ignored safely
@@ -768,19 +869,36 @@ class MissionNode(Node):
             return
 
         if (not success) or (rfid_card_id != self.assigned_rfid):
+            self.rfid_failed_attempts += 1
+            remaining_attempts = self.RFID_MAX_ATTEMPTS - self.rfid_failed_attempts
+
             self.get_logger().error(
-                f"RFID failed: success={success}, card={rfid_card_id}, expected={self.assigned_rfid}"
+                f"RFID failed attempt {self.rfid_failed_attempts}/{self.RFID_MAX_ATTEMPTS}: "
+                f"success={success}, card={rfid_card_id}, expected={self.assigned_rfid}"
             )
 
-            self.waiting_for_rfid = False
             self.rfid_verified = False
+
+            if self.rfid_failed_attempts < self.RFID_MAX_ATTEMPTS:
+                self.waiting_for_rfid = True
+                self.mission_state = "rfidAwaiting"
+
+                self._publish_mission_state()
+                self._publish_mission_event(
+                    "rfidRetry",
+                    f"Wrong RFID card. {remaining_attempts} attempt(s) remaining.",
+                    70,
+                )
+                return
+
+            self.waiting_for_rfid = False
             self.mission_state = "failed"
             self.fault_type = "rfidFailed"
 
             self._publish_mission_state()
             self._publish_mission_event(
                 "error",
-                "RFID verification failed.",
+                "RFID verification failed after 3 attempts.",
                 0,
             )
             return
@@ -789,6 +907,15 @@ class MissionNode(Node):
 
         self.waiting_for_rfid = False
         self.rfid_verified = True
+        self.waiting_for_storage_close = True
+        self.rfid_failed_attempts = 0
+
+        self._set_mission_state(
+            "storageOpened",
+            "storageOpened",
+            "RFID verified. Storage opened for customer.",
+            80,
+        )
 
         self._start_open_storage_thread()
 
@@ -824,6 +951,15 @@ class MissionNode(Node):
 
     def order_request_callback(self, msg: String):
         self.get_logger().info(f"RX /mission/order_request: {msg.data}")
+
+        if self.robot_mode == "manual":
+            self.get_logger().warn("Rejecting order: robot is in manual mode.")
+            self._publish_mission_event(
+                "orderRejected",
+                "Robot is in manual control mode. Switch to autonomous to place orders.",
+                0,
+            )
+            return
 
         if self.mission_state != "idle":
             self.get_logger().warn(
@@ -893,6 +1029,7 @@ class MissionNode(Node):
         self.active_fruit = fruit
         self.fault_type = "none"
         self.latest_valid = False
+        self.latest_detected_fruit = ""
         self.waiting_for_valid = False
         self.storage_done_for_current_target = False
 
