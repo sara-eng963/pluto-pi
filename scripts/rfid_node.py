@@ -29,6 +29,7 @@ Important:
 """
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 
@@ -307,6 +308,7 @@ class RFIDNode(Node):
         version = self.reader.read_version()
 
         self.get_logger().info("RFID node started.")
+        self.get_logger().info(f"RFID executable path: {os.path.abspath(__file__)}")
         self.get_logger().info(
             f"MFRC522 SPI bus={self.spi_bus}, device={self.spi_device}, speed={self.spi_speed_hz}"
         )
@@ -315,6 +317,8 @@ class RFIDNode(Node):
 
         self.last_uid = ""
         self.last_publish_time = 0.0
+        self.poll_count = 0
+        self.no_uid_count = 0
 
         period = 1.0 / max(self.poll_hz, 0.1)
         self.timer = self.create_timer(period, self.poll_once)
@@ -339,11 +343,25 @@ class RFIDNode(Node):
         self.get_logger().info(f"PUB /mission/rfid_verification: {msg.data}")
 
     def poll_once(self):
-        uid = self.reader.read_uid()
+        self.poll_count += 1
 
-        if uid is None:
+        try:
+            uid = self.reader.read_uid()
+        except Exception as exc:
+            self.get_logger().error(f"RFID poll error: {exc}")
             return
 
+        if uid is None:
+            self.no_uid_count += 1
+            if self.no_uid_count % max(int(self.poll_hz * 5.0), 1) == 0:
+                version = self.reader.read_version()
+                self.get_logger().info(
+                    f"RFID polling: no UID detected after {self.no_uid_count} empty polls. "
+                    f"VersionReg=0x{version:02X}"
+                )
+            return
+
+        self.no_uid_count = 0
         uid_text = self.format_uid(uid)
         now = time.monotonic()
 
