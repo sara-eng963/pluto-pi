@@ -138,9 +138,9 @@ class TestTuneNode(Node):
 
         # Velocity PID tracking — initialised to firmware defaults
         # (WheelVelocityController.cpp order: R1=0, R2=1, F1=2, F2=3)
-        self._vkp_per_wheel: list[float] = [8.0,  6.0,  5.0,  6.5]
-        self._vki_per_wheel: list[float] = [0.50, 0.35, 0.30, 0.35]
-        self._vkd_per_wheel: list[float] = [0.03, 0.02, 0.02, 0.02]
+        self._vkp_per_wheel: list[float] = [4.9,  5.5,  4.7,  5.8]
+        self._vki_per_wheel: list[float] = [0.40, 0.45, 0.45, 0.45]
+        self._vkd_per_wheel: list[float] = [0.02, 0.02, 0.02, 0.02]
 
         # Velocity sample collection (filled during auto modes)
         self._vel_samples: list[dict]              = []
