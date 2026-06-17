@@ -78,6 +78,8 @@ def generate_launch_description():
             executable="rfid_node.py",
             name="rfid_node",
             output="screen",
+            respawn=True,
+            respawn_delay=3.0,
         ),
         Node(
             package="pluto",

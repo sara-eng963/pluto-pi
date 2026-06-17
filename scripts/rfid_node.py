@@ -299,11 +299,7 @@ class RFIDNode(Node):
             10,
         )
 
-        self.reader = MFRC522(
-            bus=self.spi_bus,
-            device=self.spi_device,
-            speed_hz=self.spi_speed_hz,
-        )
+        self.reader = self._init_reader_with_retry()
 
         version = self.reader.read_version()
 
@@ -321,6 +317,26 @@ class RFIDNode(Node):
 
         period = 1.0 / max(self.poll_hz, 0.1)
         self.timer = self.create_timer(period, self.poll_once)
+
+    def _init_reader_with_retry(self, retries: int = 5, delay_sec: float = 2.0) -> "MFRC522":
+        for attempt in range(1, retries + 1):
+            try:
+                reader = MFRC522(
+                    bus=self.spi_bus,
+                    device=self.spi_device,
+                    speed_hz=self.spi_speed_hz,
+                )
+                return reader
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"MFRC522 SPI init attempt {attempt}/{retries} failed: {exc}"
+                )
+                if attempt < retries:
+                    time.sleep(delay_sec)
+        raise RuntimeError(
+            f"Failed to open SPI bus={self.spi_bus} device={self.spi_device} "
+            f"after {retries} attempts."
+        )
 
     def format_uid(self, uid: list[int]) -> str:
         return ":".join(f"{byte:02X}" for byte in uid)
