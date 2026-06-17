@@ -78,7 +78,7 @@ from std_msgs.msg import Float32
 from std_msgs.msg import String
 
 
-STATIC_AVOIDANCE_DISTANCE = 0.40
+STATIC_AVOIDANCE_SIDE_DISTANCE = 0.40
 STATIC_AVOIDANCE_FORWARD_DISTANCE = 0.40
 FRUIT_EXIT_BACKUP_DISTANCE = 0.15
 OBSTACLE_IGNORE_DISTANCE_LEFT_THRESHOLD = 0.45
@@ -460,7 +460,11 @@ class NavigationNode(Node):
             self.waiting_dynamic_clear = False
             self.static_blocked = True
             self.interrupt_requested = True
-            self.send_stop()
+
+            if not self.last_status.startswith("FROZEN"):
+                self.send_stop()
+            else:
+                self.get_logger().info("ESP already FROZEN; not sending duplicate STOP.")
 
     def navigation_goal_callback(self, msg: RosPose2D):
         """
@@ -1210,10 +1214,16 @@ class NavigationNode(Node):
 
     def wait_until_drive_idle(self, timeout_sec: float = 2.0) -> bool:
         """
-        Poll ESP1 STATUS until active=0.
+        Poll ESP1 until drive is no longer actively moving.
 
-        Used after obstacle STOP so resume commands are sent only when ESP1
-        is no longer busy.
+        Accepts:
+            STATUS ... active=0
+            FROZEN
+            STOPPED
+
+        Reason:
+            After obstacle STOP, ESP may answer FROZEN instead of STATUS active=0.
+            For static avoidance, FROZEN is safe enough to continue with STATUS parsing.
         """
 
         start_time = time.time()
@@ -1223,26 +1233,39 @@ class NavigationNode(Node):
             self.last_status_text = ""
             self.publish_command("STATUS")
 
-            if self.wait_for_status_response(timeout_sec=1.0):
-                is_active = self.parse_status_active_flag(self.last_status_text)
+            response_start = time.time()
 
-                if is_active is False:
+            while rclpy.ok():
+                rclpy.spin_once(self, timeout_sec=0.01)
+
+                if self.last_status.startswith("FROZEN") or self.last_status.startswith("STOPPED"):
+                    self.get_logger().info(
+                        f"Drive considered idle from ESP response: {self.last_status}"
+                    )
                     return True
 
-                if is_active is True:
-                    time.sleep(0.05)
-                else:
+                if self.last_status_text.startswith("STATUS"):
+                    is_active = self.parse_status_active_flag(self.last_status_text)
+
+                    if is_active is False:
+                        return True
+
+                    if is_active is True:
+                        break
+
                     self.get_logger().warn(
                         f"STATUS missing active flag: {self.last_status_text}"
                     )
-                    time.sleep(0.05)
-            else:
-                # Keep retrying within timeout window.
-                time.sleep(0.05)
+                    break
+
+                if time.time() - response_start > 1.0:
+                    break
 
             if time.time() - start_time > timeout_sec:
                 self.get_logger().error("Timeout waiting for ESP1 drive idle.")
                 return False
+
+            time.sleep(0.05)
 
         return False
 
