@@ -73,6 +73,7 @@ from geometry_msgs.msg import Pose2D as RosPose2D
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from std_msgs.msg import Bool
+from std_msgs.msg import Empty
 from std_msgs.msg import Float32
 from std_msgs.msg import String
 
@@ -145,6 +146,7 @@ class NavigationNode(Node):
         #   STOP
         #   STATUS
         self.cmd_pub = self.create_publisher(String, "/drive_cmd", 10)
+        self.zero_yaw_pub = self.create_publisher(Empty, "/zero_yaw", 10)
         self.mission_reset_pub = self.create_publisher(
             Bool,
             "/mission_reset_obstacle",
@@ -190,6 +192,12 @@ class NavigationNode(Node):
             String,
             "/drive_status",
             self.status_callback,
+            10,
+        )
+        self.gui_zero_yaw_sub = self.create_subscription(
+            Empty,
+            "/gui_zero_yaw",
+            self.gui_zero_yaw_callback,
             10,
         )
         self.navigation_goal_sub = self.create_subscription(
@@ -268,7 +276,7 @@ class NavigationNode(Node):
 
         self.active_target_pose = None
         self.static_avoidance_count = 0
-        self.next_axis_order = "XY"
+        self.next_axis_order = None
         # ---------------------------------------------------------------------
 
         # Subscriber for obstacle events from mission_node.
@@ -309,6 +317,14 @@ class NavigationNode(Node):
     # -------------------------------------------------------------------------
     # CALLBACK FROM ESP
     # -------------------------------------------------------------------------
+
+    def gui_zero_yaw_callback(self, msg):
+        self.zero_yaw_pub.publish(Empty())
+        self.get_logger().info('Relayed /gui_zero_yaw to /zero_yaw')
+
+    def send_zero_yaw(self):
+        self.zero_yaw_pub.publish(Empty())
+        self.get_logger().info('Published /zero_yaw')
 
     def status_callback(self, msg: String):
         """
@@ -1351,14 +1367,6 @@ class NavigationNode(Node):
 
         upper = command.strip().upper()
 
-        if upper.startswith("MOVE"):
-            success = self.prepare_remaining_move_after_interrupt(command)
-            if not success:
-                self.get_logger().error(
-                    "Cannot resume MOVE because remaining distance is unknown."
-                )
-                return INTERRUPT_FAILED
-
         result = self.wait_for_dynamic_clear_or_static()
 
         if result == "STATIC":
@@ -1370,14 +1378,15 @@ class NavigationNode(Node):
 
             self.get_logger().warn("Static obstacle detected during MOVE.")
 
-            if not self.remaining_move_valid:
-                self.get_logger().error(
-                    "Cannot perform static avoidance: missing interrupted MOVE STATUS."
-                )
-                return INTERRUPT_FAILED
-
             if not self.wait_until_drive_idle():
                 self.get_logger().error("Cannot avoid: ESP1 still busy after STOP.")
+                return INTERRUPT_FAILED
+
+            time.sleep(0.2)
+            if not self.prepare_remaining_move_after_interrupt(command):
+                self.get_logger().error(
+                    "Cannot resume MOVE because remaining distance is unknown."
+                )
                 return INTERRUPT_FAILED
 
             interrupted_heading = self.normalize_yaw_deg(self.interrupted_move_heading)
@@ -1466,7 +1475,11 @@ class NavigationNode(Node):
             return INTERRUPT_FAILED
 
         if upper.startswith("MOVE"):
-            if not self.remaining_move_valid:
+            time.sleep(0.2)
+            if not self.prepare_remaining_move_after_interrupt(command):
+                self.get_logger().error(
+                    "Cannot resume MOVE because remaining distance is unknown."
+                )
                 return INTERRUPT_FAILED
 
             if not self.has_remaining_move:
@@ -1626,6 +1639,20 @@ class NavigationNode(Node):
             and abs(self.normalize_yaw_deg(a.yaw) - self.normalize_yaw_deg(b.yaw)) < 1e-6
         )
 
+    def get_default_axis_order_for_mission_state(self) -> str:
+        if self.latest_mission_state == "headingToFruit":
+            return "YX"
+
+        if self.latest_mission_state in (
+            "headingToCustomer",
+            "headingHome",
+            "returningHome",
+            "visionFailedReturning",
+        ):
+            return "XY"
+
+        return "XY"
+
     def manhattan_commands(self, target_pose: Pose2D, axis_order: str = "XY") -> List[str]:
         """
         Convert target pose into Manhattan-style ROTATE/MOVE commands.
@@ -1719,7 +1746,7 @@ class NavigationNode(Node):
                 yaw=normalized_target.yaw,
             )
             self.static_avoidance_count = 0
-            self.next_axis_order = "XY"
+            self.next_axis_order = None
 
         # Start each navigation request from an idle obstacle state, then drain
         # stale queued callbacks while idle so old obstacle events are ignored.
@@ -1741,12 +1768,23 @@ class NavigationNode(Node):
                 self.navigation_active = False
                 self.active_target_pose = None
                 self.static_avoidance_count = 0
-                self.next_axis_order = "XY"
+                self.next_axis_order = None
                 return False
+
+        axis_order = (
+            self.next_axis_order
+            if self.next_axis_order is not None
+            else self.get_default_axis_order_for_mission_state()
+        )
+
+        self.get_logger().info(
+            f"Using Manhattan axis order: {axis_order} "
+            f"(mission_state={self.latest_mission_state})"
+        )
 
         commands = self.manhattan_commands(
             normalized_target,
-            axis_order=self.next_axis_order,
+            axis_order=axis_order,
         )
 
         self.get_logger().info("Generated command sequence:")
@@ -1803,7 +1841,7 @@ class NavigationNode(Node):
                     self.command_active = False
                     self.active_target_pose = None
                     self.static_avoidance_count = 0
-                    self.next_axis_order = "XY"
+                    self.next_axis_order = None
                     return False
 
             elif result == "FAILED":
@@ -1813,7 +1851,7 @@ class NavigationNode(Node):
                 self.navigation_active = False
                 self.active_target_pose = None
                 self.static_avoidance_count = 0
-                self.next_axis_order = "XY"
+                self.next_axis_order = None
                 return False
 
             # Short controlled pause between commands.
@@ -1837,7 +1875,7 @@ class NavigationNode(Node):
         self.navigation_active = False
         self.active_target_pose = None
         self.static_avoidance_count = 0
-        self.next_axis_order = "XY"
+        self.next_axis_order = None
 
         return True
 

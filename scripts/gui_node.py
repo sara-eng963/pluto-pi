@@ -11,7 +11,7 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Pose2D, Twist
-from std_msgs.msg import Bool, Float32, Int32, String
+from std_msgs.msg import Bool, Empty, Float32, Int32, String
 
 try:
     import websockets
@@ -65,6 +65,7 @@ class GuiNode(Node):
         self.gripper_pub              = self.create_publisher(String, "/gripper/command",               10)
         self.esp2_gripper_pub         = self.create_publisher(String, "/esp2/gripper_cmd",              10)
         self.esp2_position_pub        = self.create_publisher(Int32,  "/esp2/position_cmd",             10)
+        self.gui_zero_yaw_pub         = self.create_publisher(Empty,  "/gui_zero_yaw",                  10)
 
         # ──────────────────────────────────────────────────────────────────
         # ROS subscribers  (ROS → Flutter)
@@ -383,6 +384,11 @@ class GuiNode(Node):
                 self.get_logger().info(f"[Session] Logout for {username}.")
             return
 
+        # ── IMU zero yaw → /gui_zero_yaw ─────────────────────────────────
+        if msg_type == "imu.zero_yaw":
+            self.publish_zero_yaw()
+            return
+
         # ── Gap 5: Rejected unsafe commands ───────────────────────────────
         rejected = {
             "debug.obstacle_inject",
@@ -415,6 +421,10 @@ class GuiNode(Node):
     # ══════════════════════════════════════════════════════════════════════
     # Outgoing helpers  (ROS state → send_to_flutter → pi_server → Flutter)
     # ══════════════════════════════════════════════════════════════════════
+
+    def publish_zero_yaw(self):
+        self.gui_zero_yaw_pub.publish(Empty())
+        self.get_logger().info('Published /gui_zero_yaw')
 
     def _battery_percent_from_voltage(self, voltage: float) -> int:
         """Simple linear estimate: 7.5 V = 0%, 12.6 V = 100%."""
