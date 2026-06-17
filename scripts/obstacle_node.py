@@ -110,6 +110,10 @@ class ObstacleNode(Node):
     def obstacle_callback(self, msg: Int32):
         latest_mask = msg.data
         self.latest_mask = latest_mask
+        self.get_logger().info(
+            f"RX /obstacle_status: mask={self.latest_mask} "
+            f"({self.mask_to_text(self.latest_mask)})"
+        )
 
         if self.obstacle_ignore_active and self.latest_mask != 0:
             if self.state != "CLEAR":
