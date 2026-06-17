@@ -55,12 +55,6 @@ def generate_launch_description():
         ),
         Node(
             package="pluto",
-            executable="obstacle_node.py",
-            name="obstacle_node",
-            output="screen",
-        ),
-        Node(
-            package="pluto",
             executable="navigation_node.py",
             name="navigation_node",
             output="screen",
@@ -87,6 +81,13 @@ def generate_launch_description():
         ),
     ]
 
+    obstacle_node = Node(
+        package="pluto",
+        executable="obstacle_node.py",
+        name="obstacle_node",
+        output="screen",
+    )
+
     return LaunchDescription(
         [
             cleanup_ros_processes,
@@ -97,6 +98,7 @@ def generate_launch_description():
                         micro_ros_agent_usb0,
                         TimerAction(period=1.0, actions=[micro_ros_agent_usb1]),
                         TimerAction(period=3.0, actions=pluto_nodes),
+                        TimerAction(period=10.0, actions=[obstacle_node]),
                     ],
                 )
             ),
