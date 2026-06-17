@@ -229,6 +229,15 @@ class NavigationNode(Node):
         # If dx or dy is smaller than this, skip that movement.
         self.position_tolerance = position_tolerance
 
+        # True while send_command_and_wait() owns the ESP handshake channel.
+        # Prevents the debug STATUS timer from injecting a STATUS reply
+        # that satisfies a RESET/STOP/RESUME response wait.
+        self.esp_transaction_active = False
+
+        # Set True after startup RESET + idle verification succeeds.
+        # Navigation goals are rejected until this is True.
+        self.esp_ready = False
+
         # Latest ESP message.
         self.last_status = ""
         self.latest_mission_state = ""
@@ -518,9 +527,11 @@ class NavigationNode(Node):
             result = self.send_command_and_wait("RESET")
 
             if result == "DONE":
+                self.esp_ready = True
                 self.publish_navigation_result("NAV_RESET")
                 self.publish_navigation_status("RESET")
             else:
+                self.esp_ready = False
                 self.publish_navigation_result("NAV_RESET_FAILED")
                 self.publish_navigation_status("RESET_FAILED")
 
@@ -754,16 +765,74 @@ class NavigationNode(Node):
         """
         Request ESP STATUS once per second for debug yaw publishing.
 
-        Do not request during active MOVE/ROTATE commands because STATUS replies
-        can interfere with ACK/DONE waiting logic.
+        Do not request during active MOVE/ROTATE commands or while a command
+        handshake is in progress, because STATUS replies can interfere with
+        ACK/DONE/RESET/FROZEN/RESUMED waiting logic.
         """
 
-        if self.command_active:
+        if self.command_active or self.esp_transaction_active:
             return
 
         msg = String()
         msg.data = "STATUS"
         self.cmd_pub.publish(msg)
+
+    def wait_for_specific_response(self, prefix: str, timeout_sec: float) -> bool:
+        """
+        Wait until last_status starts with the given prefix.
+
+        Used for non-motion commands where we need a strict match
+        (RESET → "RESET", STOP → "FROZEN"/"STOPPED", RESUME → "RESUMED").
+        """
+
+        start_time = time.time()
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.01)
+
+            if self.last_status.startswith(prefix):
+                return True
+
+            if self.fault_received:
+                self.get_logger().error(
+                    f"ESP error while waiting for '{prefix}': {self.last_status}"
+                )
+                return False
+
+            if time.time() - start_time > timeout_sec:
+                self.get_logger().error(
+                    f"Timeout waiting for ESP response starting with '{prefix}'."
+                )
+                return False
+
+        return False
+
+    def wait_for_specific_response_any(self, prefixes: tuple, timeout_sec: float) -> bool:
+        """
+        Wait until last_status starts with any of the given prefixes.
+        """
+
+        start_time = time.time()
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.01)
+
+            if any(self.last_status.startswith(p) for p in prefixes):
+                return True
+
+            if self.fault_received:
+                self.get_logger().error(
+                    f"ESP error while waiting for {prefixes}: {self.last_status}"
+                )
+                return False
+
+            if time.time() - start_time > timeout_sec:
+                self.get_logger().error(
+                    f"Timeout waiting for ESP response matching {prefixes}."
+                )
+                return False
+
+        return False
 
     def extract_status_float(self, status_text: str, key: str):
         prefix = key + "="
@@ -1091,6 +1160,20 @@ class NavigationNode(Node):
         if not command:
             return "DONE"
 
+        self.esp_transaction_active = True
+        try:
+            return self._send_command_and_wait_inner(
+                command, ack_timeout_sec, motion_timeout_sec
+            )
+        finally:
+            self.esp_transaction_active = False
+
+    def _send_command_and_wait_inner(
+        self,
+        command: str,
+        ack_timeout_sec: float,
+        motion_timeout_sec: float,
+    ) -> str:
         self.reset_wait_flags()
         self.expected_done_keyword = self.expected_done_from_command(command)
 
@@ -1101,10 +1184,25 @@ class NavigationNode(Node):
         self.publish_command(command)
         self.refresh_obstacle_ignore()
 
-        # STATUS / STOP / tuning commands.
+        # Non-motion commands: use strict prefix matching so that stale STATUS,
+        # DEBUG, or other messages cannot satisfy the response wait.
         if not self.is_motion_command(command):
             self.set_obstacle_ignore(False, force=True)
-            got_response = self.wait_for_any_response(timeout_sec=ack_timeout_sec)
+            upper_cmd = command.strip().upper().split()[0]
+
+            if upper_cmd == "RESET":
+                got_response = self.wait_for_specific_response("RESET", timeout_sec=ack_timeout_sec)
+            elif upper_cmd == "STOP":
+                # STOP returns "FROZEN"; legacy firmware may return "STOPPED".
+                got_response = self.wait_for_specific_response_any(
+                    ("FROZEN", "STOPPED"), timeout_sec=ack_timeout_sec
+                )
+            elif upper_cmd == "RESUME":
+                got_response = self.wait_for_specific_response("RESUMED", timeout_sec=ack_timeout_sec)
+            elif upper_cmd == "STATUS":
+                got_response = self.wait_for_status_response(timeout_sec=ack_timeout_sec)
+            else:
+                got_response = self.wait_for_any_response(timeout_sec=ack_timeout_sec)
 
             if not got_response:
                 self.get_logger().error(f"No ESP response for command: {command}")
@@ -2092,11 +2190,43 @@ def main(args=None):
     input_thread.start()
 
     try:
-        # Reset ESP1 drive state on startup.
-        # This clears frozen/busy state left from previous runs.
-        node.send_command_and_wait("RESET")
-        time.sleep(0.2)
-        node.send_command_and_wait("STATUS")
+        # ---- Startup: RESET ESP1 and verify it is idle before accepting goals ----
+        node.get_logger().info("Startup: sending RESET to ESP1...")
+        reset_ok = False
+        for attempt in range(3):
+            result = node.send_command_and_wait("RESET", ack_timeout_sec=10.0)
+            if result == "DONE":
+                reset_ok = True
+                break
+            node.get_logger().warn(f"Startup RESET attempt {attempt + 1}/3 failed, retrying...")
+            time.sleep(0.5)
+
+        if reset_ok:
+            # Verify active=0 in STATUS before accepting any goals.
+            node.reset_wait_flags()
+            node.last_status_text = ""
+            node.publish_command("STATUS")
+            if node.wait_for_status_response(timeout_sec=5.0):
+                is_active = node.parse_status_active_flag(node.last_status_text)
+                if is_active is False:
+                    node.esp_ready = True
+                    node.get_logger().info("ESP1 confirmed idle — navigation ready.")
+                else:
+                    node.get_logger().error(
+                        f"ESP1 still active after RESET: {node.last_status_text}"
+                    )
+            else:
+                node.get_logger().error("No STATUS response after startup RESET.")
+        else:
+            node.get_logger().error("Startup RESET failed after 3 attempts.")
+
+        if not node.esp_ready:
+            node.publish_navigation_result("NAV_RESET_FAILED")
+            node.publish_navigation_status("RESET_FAILED")
+            node.get_logger().error(
+                "ESP1 not ready after startup. Navigation goals will be rejected until RESET succeeds."
+            )
+        # -------------------------------------------------------------------------
 
         while rclpy.ok():
             rclpy.spin_once(node, timeout_sec=0.1)
@@ -2107,7 +2237,11 @@ def main(args=None):
                 queued_goal = None
 
             if queued_goal is not None:
-                if node.robot_mode == "manual":
+                if not node.esp_ready:
+                    node.get_logger().error(
+                        "Rejecting navigation goal: ESP1 not ready (startup RESET failed)."
+                    )
+                elif node.robot_mode == "manual":
                     node.get_logger().warn(
                         "Discarding queued goal: robot is in manual mode."
                     )
