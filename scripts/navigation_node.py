@@ -78,10 +78,12 @@ from std_msgs.msg import String
 
 
 STATIC_AVOIDANCE_DISTANCE = 0.50
-MAX_STATIC_AVOIDANCE_ATTEMPTS = 3
 FRUIT_EXIT_BACKUP_DISTANCE = 0.25
 FRUIT_TARGET_OBSTACLE_IGNORE_DISTANCE = 0.85  # meters
 DEFAULT_TARGET_OBSTACLE_IGNORE_DISTANCE = 0.50  # meters
+ESP_ACK_TIMEOUT_SEC = 15.0
+ESP_MOTION_TIMEOUT_SEC = 60.0
+ESP_STATUS_TIMEOUT_SEC = 5.0
 INTERRUPT_RESUMED = "INTERRUPT_RESUMED"
 STATIC_AVOIDANCE_DONE = "STATIC_AVOIDANCE_DONE"
 INTERRUPT_FAILED = "INTERRUPT_FAILED"
@@ -796,7 +798,7 @@ class NavigationNode(Node):
     # WAIT FUNCTIONS
     # -------------------------------------------------------------------------
 
-    def wait_for_ack(self, timeout_sec: float) -> bool:
+    def wait_for_ack(self, command: str, timeout_sec: float) -> bool:
         """
         Wait for ESP to accept a motion command.
         """
@@ -815,12 +817,14 @@ class NavigationNode(Node):
 
             if self.fault_received:
                 self.get_logger().error(
-                    f"ESP error while waiting for ACK: {self.last_status}"
+                    f"ESP FAULT/ERR while waiting for ACK for {command}: {self.last_status}"
                 )
                 return False
 
             if time.time() - start_time > timeout_sec:
-                self.get_logger().error("Timeout waiting for ACK.")
+                self.get_logger().error(
+                    f"ACK TIMEOUT for command: {command}, last_status={self.last_status}"
+                )
                 return False
 
         return False
@@ -880,7 +884,7 @@ class NavigationNode(Node):
 
         return False
 
-    def wait_for_done(self, timeout_sec: float) -> str:
+    def wait_for_done(self, command: str, timeout_sec: float) -> str:
         """
         Wait for ESP to finish a MOVE or ROTATE command.
 
@@ -912,11 +916,15 @@ class NavigationNode(Node):
                 return "DONE"
 
             if self.fault_received:
-                self.get_logger().error(f"Motion failed: {self.last_status}")
+                self.get_logger().error(
+                    f"ESP FAULT/ERR while waiting for DONE for {command}: {self.last_status}"
+                )
                 return "FAILED"
 
             if time.time() - start_time > timeout_sec:
-                self.get_logger().error("Timeout waiting for DONE.")
+                self.get_logger().error(
+                    f"DONE TIMEOUT for command: {command}, last_status={self.last_status}"
+                )
                 self.send_stop()
                 return "FAILED"
 
@@ -925,8 +933,8 @@ class NavigationNode(Node):
     def send_command_and_wait(
         self,
         command: str,
-        ack_timeout_sec: float = 5.0,
-        motion_timeout_sec: float = 30.0,
+        ack_timeout_sec: float = ESP_ACK_TIMEOUT_SEC,
+        motion_timeout_sec: float = ESP_MOTION_TIMEOUT_SEC,
     ) -> str:
         """
         Send one ESP command and wait for the correct response.
@@ -952,6 +960,9 @@ class NavigationNode(Node):
         self.reset_wait_flags()
         self.expected_done_keyword = self.expected_done_from_command(command)
 
+        self.get_logger().info(
+            f"WAITING FOR ACK: {command}, timeout={ack_timeout_sec}s"
+        )
         self.publish_command(command)
         self.refresh_obstacle_ignore_zone()
 
@@ -967,7 +978,7 @@ class NavigationNode(Node):
             return "DONE"
 
         # MOVE / ROTATE: first wait for ACK.
-        got_ack = self.wait_for_ack(timeout_sec=ack_timeout_sec)
+        got_ack = self.wait_for_ack(command, timeout_sec=ack_timeout_sec)
 
         if not got_ack:
             self.get_logger().error(f"No valid ACK for command: {command}")
@@ -975,7 +986,11 @@ class NavigationNode(Node):
             return "FAILED"
 
         # Then wait for DONE.
-        result = self.wait_for_done(timeout_sec=motion_timeout_sec)
+        self.get_logger().info(
+            f"WAITING FOR DONE: {command}, expected={self.expected_done_keyword}, "
+            f"timeout={motion_timeout_sec}s"
+        )
+        result = self.wait_for_done(command, timeout_sec=motion_timeout_sec)
 
         if result == "DONE":
             self.get_logger().info(f"Command completed: {command}")
@@ -1155,7 +1170,7 @@ class NavigationNode(Node):
         self.last_status_text = ""
         self.publish_command("STATUS")
 
-        if not self.wait_for_status_response(timeout_sec=5.0):
+        if not self.wait_for_status_response(timeout_sec=ESP_STATUS_TIMEOUT_SEC):
             self.get_logger().error("Failed to get STATUS from ESP1.")
             return None
 
@@ -1810,19 +1825,6 @@ class NavigationNode(Node):
                     pass
                 elif interrupt_result == STATIC_AVOIDANCE_DONE:
                     self.static_avoidance_count += 1
-
-                    if self.static_avoidance_count > MAX_STATIC_AVOIDANCE_ATTEMPTS:
-                        self.get_logger().error(
-                            "Exceeded max static avoidance attempts. Sending STOP."
-                        )
-                        self.send_stop()
-                        self.command_active = False
-                        self.navigation_active = False
-                        self.set_obstacle_ignore_zone(False, force=True)
-                        self.active_target_pose = None
-                        self.static_avoidance_count = 0
-                        self.next_axis_order = "XY"
-                        return False
 
                     self.get_logger().info(
                         "Replanning to original target from updated pose."

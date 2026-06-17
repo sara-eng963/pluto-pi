@@ -335,7 +335,10 @@ async def set_mode(request: Request):
 
 @app.post("/robot/storage/open")
 async def open_storage(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
     await _broadcast_to_ros({
         "type": "storage.open_request",
         "order_id": body.get("order_id", ""),

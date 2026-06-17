@@ -58,8 +58,8 @@ class MissionNode(Node):
         # Temporary hardcoded fruit poses for Stage 2
         # Later move these to YAML parameters.
         self.fruit_poses = {
-            "Apple": (1.4, 0.0, 0.0),
-            "Orange": (0.8, 0.8, 0),
+            "Apple": (1.24, 0.0, 0.0),
+            "Orange": (1.24, 0.35, 0),
             "Kiwi": (0.8, 1.4, 0),
         }
 

@@ -61,6 +61,8 @@ class GuiNode(Node):
         self.rfid_verification_pub    = self.create_publisher(String, "/mission/rfid_verification",    10)
         self.storage_close_request_pub = self.create_publisher(String, "/mission/storage_close_request", 10)
         self.cmd_vel_pub              = self.create_publisher(Twist,  "/cmd_vel",                      10)  # Gap 1
+        self.mechanism_position_pub   = self.create_publisher(String, "/mechanism/position",            10)
+        self.gripper_pub              = self.create_publisher(String, "/gripper/command",               10)
 
         # ──────────────────────────────────────────────────────────────────
         # ROS subscribers  (ROS → Flutter)
@@ -247,6 +249,26 @@ class GuiNode(Node):
                 f"PUB /cmd_vel  dir={msg.get('direction','?')}  "
                 f"vx={int(twist.linear.x)}  vy={int(twist.linear.y)}  w={int(twist.angular.z)}"
             )
+            return
+
+        # ── Mechanism position → /mechanism/position ──────────────────────
+        # Flutter sends: {"type": "mechanism.position", "position": "store"/"home"}
+        if msg_type == "mechanism.position":
+            position = msg.get("position", "home")
+            cmd      = String()
+            cmd.data = position
+            self.mechanism_position_pub.publish(cmd)
+            self.get_logger().info(f"PUB /mechanism/position  position={position}")
+            return
+
+        # ── Gripper → /gripper/command ────────────────────────────────────
+        # Flutter sends: {"type": "gripper.command", "action": "open"/"close"}
+        if msg_type == "gripper.command":
+            action = msg.get("action", "")
+            cmd      = String()
+            cmd.data = action
+            self.gripper_pub.publish(cmd)
+            self.get_logger().info(f"PUB /gripper/command  action={action}")
             return
 
         # ── Gap 2: Clear faults → /mission/control ────────────────────────
