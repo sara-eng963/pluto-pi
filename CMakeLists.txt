@@ -23,6 +23,7 @@ install(
     scripts/test_pid.py
     scripts/rfid_node.py
     scripts/gui_node.py
+    scripts/test_mfrc522_spi.py
   DESTINATION lib/${PROJECT_NAME}
 )
 # Install launch files
