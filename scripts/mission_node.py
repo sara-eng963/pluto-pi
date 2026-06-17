@@ -120,6 +120,13 @@ class MissionNode(Node):
             10,
         )
 
+        self.customer_rfid_sub = self.create_subscription(
+            String,
+            "/customer_rfid",
+            self.rfid_verification_callback,
+            10,
+        )
+
         self.storage_close_request_sub = self.create_subscription(
             String,
             "/mission/storage_close_request",

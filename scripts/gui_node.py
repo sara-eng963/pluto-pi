@@ -58,7 +58,7 @@ class GuiNode(Node):
         # ──────────────────────────────────────────────────────────────────
         self.order_request_pub        = self.create_publisher(String, "/mission/order_request",        10)
         self.mission_control_pub      = self.create_publisher(String, "/mission/control",              10)
-        self.rfid_verification_pub    = self.create_publisher(String, "/mission/rfid_verification",    10)
+        self.customer_rfid_pub        = self.create_publisher(String, "/customer_rfid",                10)
         self.storage_close_request_pub = self.create_publisher(String, "/mission/storage_close_request", 10)
         self.cmd_vel_pub              = self.create_publisher(Twist,  "/cmd_vel",                      10)  # Gap 1
         self.mechanism_position_pub   = self.create_publisher(String, "/mechanism/position",            10)
@@ -353,7 +353,7 @@ class GuiNode(Node):
             }
             self.latest_rfid_card_id  = rfid["rfid_card_id"]
             self.latest_rfid_order_id = rfid["order_id"]
-            self._pub_string(self.rfid_verification_pub, compact_json(rfid), "/mission/rfid_verification")
+            self._pub_string(self.customer_rfid_pub, compact_json(rfid), "/customer_rfid")
             return
 
         # ── Storage ───────────────────────────────────────────────────────

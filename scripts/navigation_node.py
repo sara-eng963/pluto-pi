@@ -79,7 +79,8 @@ from std_msgs.msg import String
 
 STATIC_AVOIDANCE_DISTANCE = 0.50
 FRUIT_EXIT_BACKUP_DISTANCE = 0.25
-TARGET_APPROACH_IGNORE_TOLERANCE = 0.40
+OBSTACLE_IGNORE_DISTANCE_LEFT_THRESHOLD = 0.45
+OBSTACLE_IGNORE_STATUS_TIMEOUT_SEC = 0.25
 ESP_ACK_TIMEOUT_SEC = 15.0
 ESP_MOTION_TIMEOUT_SEC = 60.0
 ESP_STATUS_TIMEOUT_SEC = 5.0
@@ -608,44 +609,85 @@ class NavigationNode(Node):
             self.navigation_active
             and self.command_active
             and self.current_command_is_move()
-            and self.active_target_pose is not None
-            and self.current_move_start_pose is not None
+            and self.ack_received
         ):
             return False
 
-        return self.current_move_ends_at_active_target()
+        distance_left = self.get_live_move_distance_left_for_obstacle_ignore()
 
-    def current_move_ends_at_active_target(self) -> bool:
-        parts = self.current_executing_command.strip().split()
-        if len(parts) < 3 or parts[0].upper() != "MOVE":
+        if distance_left is None:
             return False
 
-        try:
-            distance = float(parts[1])
-            heading = float(parts[2])
-        except ValueError:
-            return False
-
-        start = self.current_move_start_pose
-        heading = self.normalize_yaw_deg(heading)
-        end_x = start.x
-        end_y = start.y
-
-        if abs(heading - 0.0) < 1e-3:
-            end_x += distance
-        elif abs(abs(heading) - 180.0) < 1e-3:
-            end_x -= distance
-        elif abs(heading - 90.0) < 1e-3:
-            end_y += distance
-        elif abs(heading + 90.0) < 1e-3:
-            end_y -= distance
-        else:
-            return False
-
-        return (
-            abs(end_x - self.active_target_pose.x) <= TARGET_APPROACH_IGNORE_TOLERANCE
-            and abs(end_y - self.active_target_pose.y) <= TARGET_APPROACH_IGNORE_TOLERANCE
+        self.get_logger().info(
+            f"Obstacle ignore check: distance_left={distance_left:.3f} m, "
+            f"threshold={OBSTACLE_IGNORE_DISTANCE_LEFT_THRESHOLD:.3f} m"
         )
+
+        return distance_left <= OBSTACLE_IGNORE_DISTANCE_LEFT_THRESHOLD
+    def parse_move_distance_left_from_status(self, status_text: str):
+        target = None
+        moved = None
+
+        for part in status_text.split():
+            if part.startswith("target="):
+                try:
+                    target = float(part[7:])
+                except ValueError:
+                    return None
+            elif part.startswith("dist="):
+                try:
+                    moved = float(part[5:])
+                except ValueError:
+                    return None
+
+        if target is None or moved is None:
+            return None
+
+        if moved < 0.0:
+            moved = 0.0
+
+        if moved > target:
+            moved = target
+
+        distance_left = target - moved
+
+        if distance_left < 0.0:
+            distance_left = 0.0
+
+        return distance_left
+
+
+    def get_live_move_distance_left_for_obstacle_ignore(self):
+        """
+        Ask ESP1 for live MOVE progress without resetting ACK/DONE flags.
+
+        Important:
+            Do NOT use request_move_status_now() here.
+            That function calls reset_wait_flags(), which can erase ACK/DONE while
+            send_command_and_wait() is waiting.
+        """
+
+        self.last_status_text = ""
+
+        msg = String()
+        msg.data = "STATUS"
+        self.cmd_pub.publish(msg)
+
+        start_time = time.time()
+
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.01)
+
+            if self.last_status_text.startswith("STATUS"):
+                return self.parse_move_distance_left_from_status(self.last_status_text)
+
+            if time.time() - start_time > OBSTACLE_IGNORE_STATUS_TIMEOUT_SEC:
+                self.get_logger().warn(
+                    "Obstacle ignore STATUS timeout; keeping obstacle ignore inactive."
+                )
+                return None
+
+        return None
 
     def request_debug_yaw_status(self):
         """
