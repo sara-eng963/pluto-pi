@@ -79,6 +79,7 @@ from std_msgs.msg import String
 
 STATIC_AVOIDANCE_DISTANCE = 0.50
 FRUIT_EXIT_BACKUP_DISTANCE = 0.25
+TARGET_APPROACH_IGNORE_TOLERANCE = 0.50
 ESP_ACK_TIMEOUT_SEC = 15.0
 ESP_MOTION_TIMEOUT_SEC = 60.0
 ESP_STATUS_TIMEOUT_SEC = 5.0
@@ -146,6 +147,11 @@ class NavigationNode(Node):
         self.mission_reset_pub = self.create_publisher(
             Bool,
             "/mission_reset_obstacle",
+            10,
+        )
+        self.obstacle_ignore_pub = self.create_publisher(
+            Bool,
+            "/navigation/obstacle_ignore",
             10,
         )
         self.navigation_result_pub = self.create_publisher(
@@ -257,6 +263,7 @@ class NavigationNode(Node):
         self.navigation_active = False
         self.command_active = False
         self.static_avoidance_active = False
+        self.obstacle_ignore_active = False
 
         self.active_target_pose = None
         self.static_avoidance_count = 0
@@ -293,6 +300,7 @@ class NavigationNode(Node):
             1.0,
             self.request_debug_yaw_status,
         )
+        self.set_obstacle_ignore(False, force=True)
 
         self.get_logger().info("Navigation node started.")
         self.log_current_pose()
@@ -570,6 +578,75 @@ class NavigationNode(Node):
         self.get_logger().info(f"SEND: {command}")
         self.publish_navigation_status("COMMAND_EXECUTING", command=command)
 
+    def set_obstacle_ignore(self, active: bool, force: bool = False):
+        active = bool(active)
+        if not force and self.obstacle_ignore_active == active:
+            return
+
+        self.obstacle_ignore_active = active
+
+        msg = Bool()
+        msg.data = active
+        self.obstacle_ignore_pub.publish(msg)
+        self.get_logger().info(f"PUB /navigation/obstacle_ignore: {active}")
+
+    def refresh_obstacle_ignore(self):
+        self.set_obstacle_ignore(self.should_ignore_obstacles_now())
+
+    def should_ignore_obstacles_now(self) -> bool:
+        if self.latest_mission_state in ("visionChecking", "storing"):
+            return True
+
+        if self.latest_mission_state not in (
+            "headingToFruit",
+            "headingToCustomer",
+            "visionFailedReturning",
+        ):
+            return False
+
+        if not (
+            self.navigation_active
+            and self.command_active
+            and self.current_command_is_move()
+            and self.active_target_pose is not None
+            and self.current_move_start_pose is not None
+        ):
+            return False
+
+        return self.current_move_ends_at_active_target()
+
+    def current_move_ends_at_active_target(self) -> bool:
+        parts = self.current_executing_command.strip().split()
+        if len(parts) < 3 or parts[0].upper() != "MOVE":
+            return False
+
+        try:
+            distance = float(parts[1])
+            heading = float(parts[2])
+        except ValueError:
+            return False
+
+        start = self.current_move_start_pose
+        heading = self.normalize_yaw_deg(heading)
+        end_x = start.x
+        end_y = start.y
+
+        if abs(heading - 0.0) < 1e-3:
+            end_x += distance
+        elif abs(abs(heading) - 180.0) < 1e-3:
+            end_x -= distance
+        elif abs(heading - 90.0) < 1e-3:
+            end_y += distance
+        elif abs(heading + 90.0) < 1e-3:
+            end_y -= distance
+        else:
+            return False
+
+        return (
+            abs(end_x - self.active_target_pose.x) <= TARGET_APPROACH_IGNORE_TOLERANCE
+            and abs(end_y - self.active_target_pose.y) <= TARGET_APPROACH_IGNORE_TOLERANCE
+        )
+
     def request_debug_yaw_status(self):
         """
         Request ESP STATUS once per second for debug yaw publishing.
@@ -652,6 +729,7 @@ class NavigationNode(Node):
         Send STOP to ESP.
         """
 
+        self.set_obstacle_ignore(False, force=True)
         self.get_logger().warn("Sending STOP.")
         self.publish_command("STOP")
 
@@ -752,9 +830,15 @@ class NavigationNode(Node):
         """
 
         start_time = time.time()
+        last_ignore_refresh = 0.0
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.01)
+            now = time.time()
+
+            if now - last_ignore_refresh >= 0.2:
+                self.refresh_obstacle_ignore()
+                last_ignore_refresh = now
 
             if self.manual_mode_interrupt:
                 self.get_logger().warn("wait_for_ack: manual mode interrupt — aborting.")
@@ -843,9 +927,15 @@ class NavigationNode(Node):
         """
 
         start_time = time.time()
+        last_ignore_refresh = 0.0
 
         while rclpy.ok():
             rclpy.spin_once(self, timeout_sec=0.01)
+            now = time.time()
+
+            if now - last_ignore_refresh >= 0.2:
+                self.refresh_obstacle_ignore()
+                last_ignore_refresh = now
 
             if self.manual_mode_interrupt:
                 self.get_logger().warn("wait_for_done: manual mode interrupt — aborting.")
@@ -906,13 +996,16 @@ class NavigationNode(Node):
         )
 
         self.publish_command(command)
+        self.refresh_obstacle_ignore()
 
         # STATUS / STOP / tuning commands.
         if not self.is_motion_command(command):
+            self.set_obstacle_ignore(False, force=True)
             got_response = self.wait_for_any_response(timeout_sec=ack_timeout_sec)
 
             if not got_response:
                 self.get_logger().error(f"No ESP response for command: {command}")
+                self.set_obstacle_ignore(False, force=True)
                 return "FAILED"
 
             return "DONE"
@@ -922,6 +1015,7 @@ class NavigationNode(Node):
 
         if not got_ack:
             self.get_logger().error(f"No valid ACK for command: {command}")
+            self.set_obstacle_ignore(False, force=True)
             return "FAILED"
 
         # Then wait for DONE.
@@ -936,6 +1030,7 @@ class NavigationNode(Node):
         elif result == "FAILED":
             self.get_logger().error(f"Command did not finish: {command}")
 
+        self.set_obstacle_ignore(False, force=True)
         return result
 
     def execute_fruit_exit_backup(self) -> bool:
@@ -1633,6 +1728,7 @@ class NavigationNode(Node):
 
             if self.is_motion_command(command):
                 self.command_active = True
+                self.refresh_obstacle_ignore()
 
             result = self.send_command_and_wait(command)
 

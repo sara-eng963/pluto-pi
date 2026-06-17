@@ -19,6 +19,7 @@ class ObstacleNode(Node):
         self.previous_mask = None
         self.obstacle_start_time = None
         self.current_traffic = None
+        self.obstacle_ignore_active = False
 
         self.obstacle_sub = self.create_subscription(
             Int32,
@@ -30,6 +31,12 @@ class ObstacleNode(Node):
             Bool,
             "/mission_reset_obstacle",
             self.reset_callback,
+            10,
+        )
+        self.ignore_sub = self.create_subscription(
+            Bool,
+            "/navigation/obstacle_ignore",
+            self.obstacle_ignore_callback,
             10,
         )
 
@@ -71,6 +78,9 @@ class ObstacleNode(Node):
             self.get_logger().info("RX: /mission_reset_obstacle = true")
             self.reset_obstacle_state()
 
+    def obstacle_ignore_callback(self, msg: Bool):
+        self.obstacle_ignore_active = bool(msg.data)
+
     def reset_obstacle_state(self):
         self.state = "CLEAR"
         self.obstacle_start_time = None
@@ -100,6 +110,19 @@ class ObstacleNode(Node):
     def obstacle_callback(self, msg: Int32):
         latest_mask = msg.data
         self.latest_mask = latest_mask
+
+        if self.obstacle_ignore_active and self.latest_mask != 0:
+            if self.state != "CLEAR":
+                self.state = "CLEAR"
+                self.obstacle_start_time = None
+                self.previous_mask = 0
+                self._set_traffic("Y")
+                self.get_logger().info("STATE: CLEAR")
+
+            self.get_logger().info(
+                f"Ignoring obstacle mask={self.latest_mask} because navigation obstacle ignore is active."
+            )
+            return
 
         now = time.monotonic()
 
