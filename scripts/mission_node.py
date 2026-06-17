@@ -597,6 +597,7 @@ class MissionNode(Node):
         if command == "RESET":
             self.get_logger().warn("Mission RESET requested.")
             self.request_obstacle_reset()
+            self._publish_navigation_control("RESET")
             self._cancel_esp2_sequence()
 
             self.mission_state = "idle"

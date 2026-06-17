@@ -481,13 +481,53 @@ class NavigationNode(Node):
         """
 
         command = msg.data.strip().upper()
+
         if command == "STOP":
             self.send_stop()
             self.publish_navigation_result("NAV_STOPPED")
             self.publish_navigation_status("STOPPED")
-        elif command:
-            self.get_logger().warn(f"Ignoring unknown navigation control: {command}")
+            return
 
+        if command == "RESET":
+            self.get_logger().warn("Navigation RESET requested.")
+
+            self.navigation_active = False
+            self.command_active = False
+            self.static_avoidance_active = False
+            self.obstacle_active = False
+            self.waiting_dynamic_clear = False
+            self.static_blocked = False
+            self.interrupt_requested = False
+            self.remaining_move_valid = False
+            self.has_remaining_move = False
+            self.remaining_move_distance = 0.0
+            self.active_target_pose = None
+            self.static_avoidance_count = 0
+            self.next_axis_order = None
+            self.fruit_exit_backup_pending = False
+            self.fruit_exit_backup_active = False
+
+            while not self.goal_queue.empty():
+                try:
+                    self.goal_queue.get_nowait()
+                except Exception:
+                    break
+
+            self.set_obstacle_ignore(False, force=True)
+
+            result = self.send_command_and_wait("RESET")
+
+            if result == "DONE":
+                self.publish_navigation_result("NAV_RESET")
+                self.publish_navigation_status("RESET")
+            else:
+                self.publish_navigation_result("NAV_RESET_FAILED")
+                self.publish_navigation_status("RESET_FAILED")
+
+            return
+
+        if command:
+            self.get_logger().warn(f"Ignoring unknown navigation control: {command}")
     def mission_state_callback(self, msg: String):
         try:
             data = json.loads(msg.data)
@@ -2052,7 +2092,10 @@ def main(args=None):
     input_thread.start()
 
     try:
-        # First check that ESP is alive.
+        # Reset ESP1 drive state on startup.
+        # This clears frozen/busy state left from previous runs.
+        node.send_command_and_wait("RESET")
+        time.sleep(0.2)
         node.send_command_and_wait("STATUS")
 
         while rclpy.ok():
