@@ -1370,10 +1370,14 @@ class NavigationNode(Node):
                 return INTERRUPT_FAILED
 
         if upper.startswith("ROTATE"):
-            self.get_logger().error(
-                "Unexpected obstacle interrupt during ROTATE; not attempting rotate resume."
+            self.get_logger().info(
+                "Ignoring obstacle interrupt during ROTATE."
             )
-            return INTERRUPT_FAILED
+            self.interrupt_requested = False
+            self.obstacle_active = False
+            self.waiting_dynamic_clear = False
+            self.static_blocked = False
+            return INTERRUPT_RESUMED
 
         return INTERRUPT_RESUMED
 
