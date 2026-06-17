@@ -2216,6 +2216,9 @@ def main(args=None):
                 if is_active is False:
                     node.esp_ready = True
                     node.get_logger().info("ESP1 confirmed idle — navigation ready.")
+                    # Zero the IMU yaw so the robot starts with heading = 0.
+                    time.sleep(0.1)
+                    node.send_zero_yaw()
                 else:
                     node.get_logger().error(
                         f"ESP1 still active after RESET: {node.last_status_text}"
