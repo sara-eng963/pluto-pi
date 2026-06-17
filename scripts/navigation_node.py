@@ -78,8 +78,9 @@ from std_msgs.msg import Float32
 from std_msgs.msg import String
 
 
-STATIC_AVOIDANCE_DISTANCE = 0.50
-FRUIT_EXIT_BACKUP_DISTANCE = 0.25
+STATIC_AVOIDANCE_DISTANCE = 0.40
+STATIC_AVOIDANCE_FORWARD_DISTANCE = 0.40
+FRUIT_EXIT_BACKUP_DISTANCE = 0.15
 OBSTACLE_IGNORE_DISTANCE_LEFT_THRESHOLD = 0.45
 OBSTACLE_IGNORE_STATUS_TIMEOUT_SEC = 0.25
 ESP_ACK_TIMEOUT_SEC = 15.0
@@ -360,8 +361,8 @@ class NavigationNode(Node):
             self.ack_received = True
             return
 
-        # STOP response may be "STOPPED" or similar.
-        if text.startswith("STOP") or text.startswith("STOPPED"):
+        # STOP returns "FROZEN", RESUME returns "RESUMED", RESET returns "RESET".
+        if text.startswith("FROZEN") or text.startswith("RESUMED") or text.startswith("RESET") or text.startswith("STOPPED"):
             self.ack_received = True
             return
 
@@ -1427,15 +1428,29 @@ class NavigationNode(Node):
             self.static_blocked = False
             self.static_avoidance_active = True
 
+            opposite_avoid_heading = self.normalize_yaw_deg(avoid_heading + 180.0)
+
             avoidance_commands = [
+                # 1) Move sideways away from obstacle
                 f"ROTATE {avoid_heading:.0f}",
-                f"MOVE {STATIC_AVOIDANCE_DISTANCE:.2f} {avoid_heading:.0f}",
+                f"MOVE {STATIC_AVOIDANCE_SIDE_DISTANCE:.2f} {avoid_heading:.0f}",
+
+                # 2) Face original direction and pass the obstacle
+                f"ROTATE {interrupted_heading:.0f}",
+                f"MOVE {STATIC_AVOIDANCE_FORWARD_DISTANCE:.2f} {interrupted_heading:.0f}",
+
+                # 3) Move sideways back to cancel the lateral offset
+                f"ROTATE {opposite_avoid_heading:.0f}",
+                f"MOVE {STATIC_AVOIDANCE_SIDE_DISTANCE:.2f} {opposite_avoid_heading:.0f}",
+
+                # 4) Face original direction again
                 f"ROTATE {interrupted_heading:.0f}",
             ]
 
             for avoid_cmd in avoidance_commands:
                 self.current_executing_command = avoid_cmd
                 avoid_result = self.send_command_and_wait(avoid_cmd)
+
                 if avoid_result != "DONE":
                     self.get_logger().error(
                         f"Static avoidance command failed: {avoid_cmd}"
@@ -1444,12 +1459,11 @@ class NavigationNode(Node):
                     self.send_stop()
                     return INTERRUPT_FAILED
 
-            self.get_logger().info(
-                f"Updating pose by sidestep: "
-                f"{STATIC_AVOIDANCE_DISTANCE:.2f} heading {avoid_heading:.0f}"
-            )
-            self.apply_move_to_logical_pose(STATIC_AVOIDANCE_DISTANCE, avoid_heading)
-            self.get_logger().info("Pose updated after static sidestep update.")
+                self.update_pose_after_successful_command(
+                    avoid_cmd,
+                    context="static-avoidance",
+                )
+
             self.current_pose.yaw = interrupted_heading
             self.publish_current_pose()
             self.static_avoidance_active = False
@@ -1465,71 +1479,22 @@ class NavigationNode(Node):
             self.reset_mission_obstacle_state()
             return STATIC_AVOIDANCE_DONE
 
-        # Dynamic clear received.
+        # Dynamic clear received — send RESUME so the frozen PID continues from where it paused.
         self.interrupt_requested = False
         self.obstacle_active = False
         self.waiting_dynamic_clear = False
 
-        if not self.wait_until_drive_idle():
-            self.get_logger().error("Cannot resume: ESP1 still busy after STOP.")
-            return INTERRUPT_FAILED
+        self.get_logger().info("Dynamic clear: sending RESUME to unfreeze ESP motion.")
+        self.reset_wait_flags()
+        self.expected_done_keyword = self.expected_done_from_command(command)
+        self.publish_command("RESUME")
 
-        if upper.startswith("MOVE"):
-            time.sleep(0.2)
-            if not self.prepare_remaining_move_after_interrupt(command):
-                self.get_logger().error(
-                    "Cannot resume MOVE because remaining distance is unknown."
-                )
-                return INTERRUPT_FAILED
-
-            if not self.has_remaining_move:
-                self.get_logger().info("Interrupted MOVE effectively complete.")
-                # No resume command is needed; reflect completed original MOVE.
-                self.update_pose_after_successful_command(
-                    command,
-                    context="dynamic-resume",
-                )
-                self.get_logger().info(
-                    "Pose updated after dynamic resume completion (no residual MOVE)."
-                )
-                return INTERRUPT_RESUMED
-
-            resume_cmd = (
-                f"MOVE {self.remaining_move_distance:.2f} "
-                f"{self.interrupted_move_heading:.0f}"
-            )
-            self.get_logger().info(f"Resuming MOVE: {resume_cmd}")
-            self.current_executing_command = resume_cmd
-            self.command_active = True
-            resume_result = self.send_command_and_wait(resume_cmd)
-            self.command_active = False
-
-            if resume_result == "DONE":
-                self.has_remaining_move = False
-                self.remaining_move_distance = 0.0
-                # Resume completed the original interrupted MOVE.
-                self.update_pose_after_successful_command(
-                    command,
-                    context="dynamic-resume",
-                )
-                self.get_logger().info(
-                    "Pose updated after dynamic resume completion (resumed MOVE)."
-                )
-                return INTERRUPT_RESUMED
-            else:
-                return INTERRUPT_FAILED
-
-        if upper.startswith("ROTATE"):
-            self.get_logger().info(
-                "Ignoring obstacle interrupt during ROTATE."
-            )
-            self.interrupt_requested = False
-            self.obstacle_active = False
-            self.waiting_dynamic_clear = False
-            self.static_blocked = False
+        result = self.wait_for_done(command, timeout_sec=ESP_MOTION_TIMEOUT_SEC)
+        if result == "DONE":
+            self.update_pose_after_successful_command(command, context="dynamic-resume")
             return INTERRUPT_RESUMED
-
-        return INTERRUPT_RESUMED
+        else:
+            return INTERRUPT_FAILED
 
     # -------------------------------------------------------------------------
     # NAVIGATION LOGIC
