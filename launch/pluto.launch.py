@@ -55,6 +55,12 @@ def generate_launch_description():
         ),
         Node(
             package="pluto",
+            executable="obstacle_node.py",
+            name="obstacle_node",
+            output="screen",
+        ),
+        Node(
+            package="pluto",
             executable="navigation_node.py",
             name="navigation_node",
             output="screen",

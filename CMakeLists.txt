@@ -16,6 +16,7 @@ install(
     scripts/drive_client_node.py
     scripts/test_sequence_node.py
     scripts/navigation_node.py
+    scripts/obstacle_node.py
     scripts/obstacle_detection_test.py
     scripts/mission_node.py
     scripts/test_camera.py

@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 
-import time
-import threading
 import json
 
 import rclpy
@@ -14,13 +12,7 @@ class MissionNode(Node):
     def __init__(self):
         super().__init__("mission_node")
 
-        self.STATIC_CONFIRM_TIME = 4.0  # seconds
         self.REQUIRED_VALID_READINGS = 3
-
-        self.state = "CLEAR"
-        self.latest_mask = 0
-        self.previous_mask = None
-        self.obstacle_start_time = None
 
         # Mission/order state
         self.mission_state = "idle"
@@ -48,8 +40,6 @@ class MissionNode(Node):
         self.waiting_for_rfid = False
         self.rfid_verified = False
         self.waiting_for_storage_close = False
-        self.navigation_obstacle_ignore_zone = False
-
         self.robot_mode = "autonomous"  # "autonomous" | "manual"
 
         # Customer pose is HOME for this project
@@ -63,31 +53,6 @@ class MissionNode(Node):
             "Kiwi": (0.8, 1.4, 0),
         }
 
-        self.obstacle_sub = self.create_subscription(
-            Int32,
-            "/obstacle_status",
-            self.obstacle_callback,
-            10,
-        )
-        self.navigation_obstacle_ignore_zone_sub = self.create_subscription(
-            Bool,
-            "/navigation/obstacle_ignore_zone",
-            self.navigation_obstacle_ignore_zone_callback,
-            10,
-        )
-
-        self.reset_sub = self.create_subscription(
-            Bool,
-            "/mission_reset_obstacle",
-            self.reset_callback,
-            10,
-        )
-
-        self.obstacle_event_pub = self.create_publisher(
-            String,
-            "/obstacle_event",
-            10,
-        )
         self.esp2_traffic_pub = self.create_publisher(
             String,
             "/esp2/traffic_cmd",
@@ -101,6 +66,11 @@ class MissionNode(Node):
         self.esp2_position_pub = self.create_publisher(
             Int32,
             "/esp2/position_cmd",
+            10,
+        )
+        self.obstacle_reset_pub = self.create_publisher(
+            Bool,
+            "/mission_reset_obstacle",
             10,
         )
         self.esp2_status_sub = self.create_subscription(
@@ -200,26 +170,6 @@ class MissionNode(Node):
         )
 
         self.get_logger().info("Mission node started.")
-        self.get_logger().info("Obstacle logic active.")
-        self.get_logger().info("Initial state: CLEAR")
-        self.get_logger().info("Type 'c' then ENTER to reset obstacle state.")
-
-        self.input_thread = threading.Thread(
-            target=self.terminal_input_loop,
-            daemon=True,
-        )
-        self.input_thread.start()
-
-    def terminal_input_loop(self):
-        while rclpy.ok():
-            try:
-                user_input = input().strip().lower()
-            except EOFError:
-                break
-
-            if user_input == "c":
-                self.get_logger().info("TERMINAL: c pressed")
-                self.reset_obstacle_state()
 
     def _publish_string(self, publisher, data: str, topic_name: str):
         msg = String()
@@ -234,15 +184,6 @@ class MissionNode(Node):
 
 
     def _publish_mission_state(self):
-        if self.mission_state in [
-            "rfidAwaiting",
-            "storageOpened",
-            "storageClosed",
-            "idle",
-            "failed",
-        ]:
-            self.navigation_obstacle_ignore_zone = False
-
         self._publish_json(
             self.mission_state_pub,
             {
@@ -300,34 +241,11 @@ class MissionNode(Node):
             "/navigation/control",
         )
 
-    def reset_callback(self, msg: Bool):
-        if msg.data:
-            self.get_logger().info("RX: /mission_reset_obstacle = true")
-            self.reset_obstacle_state()
-
-    def navigation_obstacle_ignore_zone_callback(self, msg: Bool):
-        self.navigation_obstacle_ignore_zone = bool(msg.data)
-
-    def _should_ignore_obstacle_near_target(self) -> bool:
-        return (
-            self.navigation_obstacle_ignore_zone
-            and self.mission_state in ["headingToFruit", "headingToCustomer", "visionFailedReturning"]
-        ) or self.mission_state in ["visionChecking", "storing"]
-
-    def reset_obstacle_state(self):
-        self.state = "CLEAR"
-        self.obstacle_start_time = None
-        self.previous_mask = self.latest_mask
-        self._set_traffic("Y")
-
-        self.get_logger().info("EVENT: OBSTACLE_STATE_RESET")
-        self.get_logger().info("STATE: CLEAR")
-
-    def _publish_obstacle_event(self, event: str):
-        msg = String()
-        msg.data = event
-        self.obstacle_event_pub.publish(msg)
-        self.get_logger().info(f"PUB /obstacle_event: {event}")
+    def request_obstacle_reset(self):
+        msg = Bool()
+        msg.data = True
+        self.obstacle_reset_pub.publish(msg)
+        self.get_logger().info("PUB /mission_reset_obstacle: true")
 
     def _set_traffic(self, signal: str):
         if self.current_traffic == signal:
@@ -671,7 +589,7 @@ class MissionNode(Node):
 
         if command == "RESET":
             self.get_logger().warn("Mission RESET requested.")
-            self.reset_obstacle_state()
+            self.request_obstacle_reset()
             self._cancel_esp2_sequence()
 
             self.mission_state = "idle"
@@ -1070,120 +988,6 @@ class MissionNode(Node):
         )
         self._publish_navigation_goal(x, y, theta)
         
-    def obstacle_callback(self, msg: Int32):
-        latest_mask = msg.data
-        self.latest_mask = latest_mask
-
-        if latest_mask != 0 and self._should_ignore_obstacle_near_target():
-            self.get_logger().info(
-                f"Ignoring obstacle mask={latest_mask} because robot is in navigation target ignore zone."
-            )
-
-            if self.state in ["WAITING_FOR_CLEAR", "STATIC_LOCKED"]:
-                self.state = "CLEAR"
-                self.get_logger().info("STATE: CLEAR")
-                self._set_traffic("Y")
-
-            self.obstacle_start_time = None
-            self.previous_mask = 0
-            return
-
-        now = time.monotonic()
-
-        # ---------------------------------------------------------------------
-        # First received message
-        # ---------------------------------------------------------------------
-        if self.previous_mask is None:
-            self.previous_mask = self.latest_mask
-
-            if self.latest_mask == 0:
-                self.get_logger().info("STATE: CLEAR")
-            else:
-                self.get_logger().info(
-                    f"EVENT: OBSTACLE_DETECTED mask={self.latest_mask} "
-                    f"({self.mask_to_text(self.latest_mask)})"
-                )
-                self.state = "WAITING_FOR_CLEAR"
-                self.obstacle_start_time = now
-                self.get_logger().info("STATE: WAITING_FOR_CLEAR")
-                self._publish_obstacle_event(f"OBSTACLE_DETECTED mask={self.latest_mask}")
-                self._set_traffic("R")
-
-            return
-
-        # ---------------------------------------------------------------------
-        # STATE: CLEAR
-        # ---------------------------------------------------------------------
-        if self.state == "CLEAR":
-            if self.latest_mask != 0:
-                self.get_logger().info(
-                    f"EVENT: OBSTACLE_DETECTED mask={self.latest_mask} "
-                    f"({self.mask_to_text(self.latest_mask)})"
-                )
-                self.state = "WAITING_FOR_CLEAR"
-                self.obstacle_start_time = now
-                self.get_logger().info("STATE: WAITING_FOR_CLEAR")
-                self._publish_obstacle_event(f"OBSTACLE_DETECTED mask={self.latest_mask}")
-                self._set_traffic("R")
-
-        # ---------------------------------------------------------------------
-        # STATE: WAITING_FOR_CLEAR
-        # ---------------------------------------------------------------------
-        elif self.state == "WAITING_FOR_CLEAR":
-            if self.latest_mask == 0:
-                self.get_logger().info("EVENT: DYNAMIC_OBSTACLE_CLEARED")
-                self.state = "CLEAR"
-                self.obstacle_start_time = None
-                self.get_logger().info("STATE: CLEAR")
-                self._publish_obstacle_event("DYNAMIC_OBSTACLE_CLEARED")
-                self._set_traffic("Y")
-
-            else:
-                self._set_traffic("R")
-                elapsed = now - self.obstacle_start_time
-
-                if elapsed >= self.STATIC_CONFIRM_TIME:
-                    self.get_logger().info(
-                        f"EVENT: STATIC_OBSTACLE mask={self.latest_mask} "
-                        f"({self.mask_to_text(self.latest_mask)})"
-                    )
-                    self.state = "STATIC_LOCKED"
-                    self.get_logger().info("STATE: STATIC_LOCKED")
-                    self._publish_obstacle_event(f"STATIC_OBSTACLE mask={self.latest_mask}")
-                    self._set_traffic("R")
-
-        # ---------------------------------------------------------------------
-        # STATE: STATIC_LOCKED
-        # ---------------------------------------------------------------------
-        elif self.state == "STATIC_LOCKED":
-            # Intentionally do nothing.
-            # After static classification, clearing the sensor should not reset
-            # the state because the robot may be turning away to reroute.
-            self._set_traffic("R")
-
-        self.previous_mask = self.latest_mask
-
-    def mask_to_text(self, mask: int) -> str:
-        if mask == 0:
-            return "CLEAR"
-        elif mask == 1:
-            return "LEFT"
-        elif mask == 2:
-            return "FRONT"
-        elif mask == 3:
-            return "LEFT + FRONT"
-        elif mask == 4:
-            return "RIGHT"
-        elif mask == 5:
-            return "LEFT + RIGHT"
-        elif mask == 6:
-            return "FRONT + RIGHT"
-        elif mask == 7:
-            return "LEFT + FRONT + RIGHT"
-        else:
-            return "INVALID MASK"
-
-
 def main(args=None):
     rclpy.init(args=args)
 
