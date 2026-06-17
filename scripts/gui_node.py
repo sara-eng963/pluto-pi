@@ -63,6 +63,8 @@ class GuiNode(Node):
         self.cmd_vel_pub              = self.create_publisher(Twist,  "/cmd_vel",                      10)  # Gap 1
         self.mechanism_position_pub   = self.create_publisher(String, "/mechanism/position",            10)
         self.gripper_pub              = self.create_publisher(String, "/gripper/command",               10)
+        self.esp2_gripper_pub         = self.create_publisher(String, "/esp2/gripper_cmd",              10)
+        self.esp2_position_pub        = self.create_publisher(Int32,  "/esp2/position_cmd",             10)
 
         # ──────────────────────────────────────────────────────────────────
         # ROS subscribers  (ROS → Flutter)
@@ -233,6 +235,16 @@ class GuiNode(Node):
         publisher.publish(m)
         self.get_logger().info(f"PUB {topic}: {data[:120]}")
 
+    def _pub_int32(self, publisher, data: int, topic: str):
+        m      = Int32()
+        m.data = int(data)
+        publisher.publish(m)
+        self.get_logger().info(f"PUB {topic}: {m.data}")
+
+    def _send_esp2_gripper_sequence(self, commands):
+        for command in commands:
+            self._pub_string(self.esp2_gripper_pub, command, "/esp2/gripper_cmd")
+
     def _handle_gui_message(self, msg: Dict[str, Any]):
         msg_type = msg.get("type", "")
 
@@ -254,11 +266,17 @@ class GuiNode(Node):
         # ── Mechanism position → /mechanism/position ──────────────────────
         # Flutter sends: {"type": "mechanism.position", "position": "store"/"home"}
         if msg_type == "mechanism.position":
-            position = msg.get("position", "home")
+            position = str(msg.get("position", "home")).strip().lower()
             cmd      = String()
             cmd.data = position
             self.mechanism_position_pub.publish(cmd)
             self.get_logger().info(f"PUB /mechanism/position  position={position}")
+            if position == "home":
+                self._pub_int32(self.esp2_position_pub, 0, "/esp2/position_cmd")
+            elif position == "store":
+                self._pub_int32(self.esp2_position_pub, 90, "/esp2/position_cmd")
+            else:
+                self.get_logger().warn(f"Unknown mechanism position: {position}")
             return
 
         # ── Gripper → /gripper/command ────────────────────────────────────
@@ -340,6 +358,8 @@ class GuiNode(Node):
 
         # ── Storage ───────────────────────────────────────────────────────
         if msg_type == "storage.close_request":
+            if self.latest_mission_state != "storageOpened":
+                self._send_esp2_gripper_sequence(["close_lid", "close_lock"])
             self._pub_string(
                 self.storage_close_request_pub,
                 msg.get("order_id", ""),
@@ -348,16 +368,7 @@ class GuiNode(Node):
             return
 
         if msg_type == "storage.open_request":
-            self._pub_string(
-                self.mission_control_pub,
-                compact_json({
-                    "command":   "STORAGE_OPEN",
-                    "source":    "gui",
-                    "order_id":  msg.get("order_id", ""),
-                    "timestamp": now_iso(),
-                }),
-                "/mission/control",
-            )
+            self._send_esp2_gripper_sequence(["open_lock", "open_lid"])
             return
 
         # ── Gap 3: user.session – cache rfid_card_id ──────────────────────
