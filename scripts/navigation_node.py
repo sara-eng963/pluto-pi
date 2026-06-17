@@ -1540,15 +1540,20 @@ class NavigationNode(Node):
 
             self.get_logger().warn("Static obstacle detected during MOVE.")
 
-            if not self.wait_until_drive_idle():
-                self.get_logger().error("Cannot avoid: ESP1 still busy after STOP.")
-                return INTERRUPT_FAILED
-
-            time.sleep(0.2)
+            # Query moved distance while ESP is still frozen (STATUS replies fine).
+            # Do this BEFORE RESET so currentDistanceM is not zeroed on the ESP.
             if not self.prepare_remaining_move_after_interrupt(command):
                 self.get_logger().error(
                     "Cannot resume MOVE because remaining distance is unknown."
                 )
+                return INTERRUPT_FAILED
+
+            # ESP is frozen (active=1) — send RESET to clear frozen/active state
+            # so avoidance MOVE/ROTATE commands are accepted without ERR BUSY.
+            self.get_logger().info("Static avoidance: sending RESET to unfreeze ESP.")
+            reset_result = self.send_command_and_wait("RESET", ack_timeout_sec=5.0)
+            if reset_result != "DONE":
+                self.get_logger().error("Cannot avoid: RESET failed.")
                 return INTERRUPT_FAILED
 
             interrupted_heading = self.normalize_yaw_deg(self.interrupted_move_heading)
