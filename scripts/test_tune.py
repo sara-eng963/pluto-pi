@@ -138,15 +138,19 @@ class TestTuneNode(Node):
 
         # Velocity PID tracking — initialised to firmware defaults
         # (WheelVelocityController.cpp order: R1=0, R2=1, F1=2, F2=3)
-        self._vkp_per_wheel: list[float] = [4.93, 7.11, 4.26, 7.3]
-        self._vki_per_wheel: list[float] = [0.13, 0.10, 0.08, 0.12]
-        self._vkd_per_wheel: list[float] = [0.03, 0.015, 0.03, 0.015]
+        self._vkp_per_wheel: list[float] = [8.0,  6.0,  5.0,  6.5]
+        self._vki_per_wheel: list[float] = [0.50, 0.35, 0.30, 0.35]
+        self._vkd_per_wheel: list[float] = [0.03, 0.02, 0.02, 0.02]
 
         # Velocity sample collection (filled during auto modes)
         self._vel_samples: list[dict]              = []
         self._collecting_vel: bool                 = False
         self._vel_poll_stop                        = threading.Event()
         self._vel_poll_thread: Optional[threading.Thread] = None
+
+        # Per-wheel suggestion history for oscillation dampening.
+        # Stores recent suggestion directions: "KP↑", "KP↓", "KI↑", etc.
+        self._suggest_history: list[list[str]] = [[], [], [], []]
 
         print(MENU)
         print()
@@ -625,18 +629,26 @@ class TestTuneNode(Node):
         """
         Per-wheel PID suggestions — ONE parameter type per wheel per cycle.
 
-        Priority order (applied strictly; only the first matching rule fires):
-          1. KP ↓  — unstable / overshooting  (over% > 25 OR osc > 6 with no settle)
-          2. KP ↑  — slow / lagging            (rise > 0.8 s or mean_err > 10, no over)
-          3. KI ↑  — persistent SS error       (ss_err > 1.5 RPM, transient already OK)
-          4. KD ↑  — over + oscillation remain (over% > 15 AND osc > 4)
-          5. KI ↓  — KI suspected of causing overshoot  (over% high, ss_err low)
-          6. KD ↓  — KD adding noise, clean response
-          7. OK    — no change recommended
+        Priority order:
+          0. STALLED  — mean_measured < 15 % of mean_target despite long window
+                        → increase KI (integral overcomes static friction deadband)
+          1. KP ↓     — unstable / overshooting  (over% > 25 OR osc > 6)
+          2. KP ↑     — slow / lagging            (rise > 0.8 s or mean_err > 10)
+          3. KI ↑     — persistent SS error       (ss_err > 1.5 RPM, transient OK)
+          4. KD ↑     — over + oscillation remain (over% > 15 AND osc > 4)
+          5. KI ↓     — KI causing overshoot      (over% high, ss_err low)
+          6. KD ↓     — KD adding noise, clean response
+          7. OK       — all metrics within acceptable range
 
-        Only ONE of KP / KI / KD is suggested per wheel per call.
+        Oscillation dampening:
+          If the last two suggestions for a wheel were in opposite directions
+          (e.g., KP↑ then KP↓), the step size is halved to prevent limit-cycling.
+
+        OK criteria (all must hold):
+          over% < 15%, settle != None or (osc <= 2 and over% < 10%), mean_err < 8 RPM
         """
         _WNAMES = ["R1", "R2", "F1", "F2"]
+        _STALL_RATIO = 0.15   # mean_measured / mean_target — below this = stalled
 
         if a["active"] < 3:
             return {"msgs": ["not enough active motion data"], "cmds": {}}
@@ -646,52 +658,102 @@ class TestTuneNode(Node):
         any_suggestion = False
 
         for wi, wn in enumerate(_WNAMES):
-            mean_err = a["mean_err"][wi]
-            ss_err   = a["ss_error"][wi]
-            over_pct = a["overshoot_pct"][wi]
-            rise     = a["rise_time_s"][wi]
-            settle   = a["settling_time_s"][wi]
-            osc      = a["oscillations"][wi]
-            n_wins   = a["stable_windows"][wi]
+            mean_err    = a["mean_err"][wi]
+            ss_err      = a["ss_error"][wi]
+            over_pct    = a["overshoot_pct"][wi]
+            rise        = a["rise_time_s"][wi]
+            settle      = a["settling_time_s"][wi]
+            osc         = a["oscillations"][wi]
+            n_wins      = a["stable_windows"][wi]
+            mean_tgt    = a["mean_target"][wi]
+            mean_meas   = a["mean_measured"][wi]
 
             kp = self._vkp_per_wheel[wi]
             ki = self._vki_per_wheel[wi]
             kd = self._vkd_per_wheel[wi]
 
-            # ── Priority 1: Reduce KP (unstable / overshooting) ──────────
-            if over_pct > 25.0 or (settle is None and osc > 6 and n_wins > 0):
-                factor = 0.78 if over_pct > 40.0 or osc > 12 else 0.87
-                new_kp = round(max(kp * factor, 0.5), 2)
-                cmds[f"VKP {wi}"] = new_kp
+            # ── Oscillation dampening ──────────────────────────────────────
+            hist = self._suggest_history[wi][-3:]  # last 3 suggestions
+            def _oscillating(param: str) -> bool:
+                """True if last 2 suggestions for this param alternated direction."""
+                ups   = [h for h in hist if h == f"{param}↑"]
+                downs = [h for h in hist if h == f"{param}↓"]
+                if len(hist) >= 2 and hist[-1] != hist[-2]:
+                    # last two differ AND both are for the same param
+                    if (hist[-1].startswith(param) and hist[-2].startswith(param)):
+                        return True
+                return False
+
+            def _step(base: float, direction_key: str, pct: float) -> float:
+                """Apply pct step, halved if we've been oscillating on this param."""
+                effective = pct * 0.5 if _oscillating(direction_key) else pct
+                return effective
+
+            def _record(action: str) -> None:
+                self._suggest_history[wi].append(action)
+                if len(self._suggest_history[wi]) > 6:
+                    self._suggest_history[wi].pop(0)
+
+            # ── Priority 0: STALLED wheel ──────────────────────────────────
+            stall_ratio = mean_meas / mean_tgt if mean_tgt > 0 else 1.0
+            if stall_ratio < _STALL_RATIO and n_wins > 0:
+                # Wheel is not spinning despite a stable command.
+                # KP alone won't overcome static friction — use KI to build up
+                # integral drive, but only if anti-windup is in firmware.
+                new_ki = round(min(ki + 0.15, _LIMITS["VKI"][1]), 3)
+                cmds[f"VKI {wi}"] = new_ki
                 msgs.append(
-                    f"  {wn} [KP↓]: over {over_pct:.0f}%  osc {osc}  settle={'n/s' if settle is None else f'{settle:.2f}s'}"
-                    f" → KP {kp:.2f} → {new_kp}  (↓{100*(1-factor):.0f}%)"
+                    f"  {wn} [STALLED→KI↑]: meas {mean_meas:.1f} << tgt {mean_tgt:.1f}"
+                    f" ({100*stall_ratio:.0f}%)  → KI {ki:.3f} → {new_ki}"
+                    f"  (integral overcomes static friction)"
                 )
+                _record("KI↑")
                 any_suggestion = True
                 continue
 
-            # ── Priority 2: Increase KP (slow rise / high tracking error) ─
+            # ── Priority 1: Reduce KP (unstable / overshooting) ───────────
+            if over_pct > 25.0 or (settle is None and osc > 6 and n_wins > 0):
+                base_pct = 0.22 if over_pct > 40.0 or osc > 12 else 0.13
+                effective_pct = _step(kp, "KP", base_pct)
+                new_kp = round(max(kp * (1 - effective_pct), 0.5), 2)
+                cmds[f"VKP {wi}"] = new_kp
+                msgs.append(
+                    f"  {wn} [KP↓]: over {over_pct:.0f}%  osc {osc}"
+                    f"  settle={'n/s' if settle is None else f'{settle:.2f}s'}"
+                    f" → KP {kp:.2f} → {new_kp}"
+                    + ("  (halved — oscillating)" if _oscillating("KP") else f"  (↓{100*effective_pct:.0f}%)")
+                )
+                _record("KP↓")
+                any_suggestion = True
+                continue
+
+            # ── Priority 2: Increase KP (slow rise / high tracking error) ──
             if (rise is not None and rise > 0.8 and over_pct < 10.0) or \
                (mean_err > 10.0 and over_pct < 15.0):
-                factor = 1.20 if mean_err > 10.0 else 1.15
-                new_kp = round(min(kp * factor, _LIMITS["VKP"][1]), 2)
+                base_pct = 0.20 if mean_err > 10.0 else 0.15
+                effective_pct = _step(kp, "KP", base_pct)
+                new_kp = round(min(kp * (1 + effective_pct), _LIMITS["VKP"][1]), 2)
                 reason = (f"rise {rise:.2f}s" if rise is not None and rise > 0.8
                           else f"err {mean_err:.1f} RPM")
                 cmds[f"VKP {wi}"] = new_kp
                 msgs.append(
                     f"  {wn} [KP↑]: {reason}"
-                    f" → KP {kp:.2f} → {new_kp}  (+{100*(factor-1):.0f}%)"
+                    f" → KP {kp:.2f} → {new_kp}"
+                    + ("  (halved — oscillating)" if _oscillating("KP") else f"  (+{100*effective_pct:.0f}%)")
                 )
+                _record("KP↑")
                 any_suggestion = True
                 continue
 
             if mean_err > 5.0 and over_pct < 15.0:
-                new_kp = round(min(kp * 1.10, _LIMITS["VKP"][1]), 2)
+                effective_pct = _step(kp, "KP", 0.10)
+                new_kp = round(min(kp * (1 + effective_pct), _LIMITS["VKP"][1]), 2)
                 cmds[f"VKP {wi}"] = new_kp
                 msgs.append(
                     f"  {wn} [KP↑]: err {mean_err:.1f} RPM moderate"
-                    f" → KP {kp:.2f} → {new_kp}  (+10%)"
+                    f" → KP {kp:.2f} → {new_kp}  (+{100*effective_pct:.0f}%)"
                 )
+                _record("KP↑")
                 any_suggestion = True
                 continue
 
@@ -704,10 +766,11 @@ class TestTuneNode(Node):
                     f"  {wn} [KI↑]: SS {ss_err:.2f} RPM (from {n_wins} window(s))"
                     f" → KI {ki:.3f} → {new_ki}"
                 )
+                _record("KI↑")
                 any_suggestion = True
                 continue
 
-            # ── Priority 4: Increase KD (over + oscillation persist) ──────
+            # ── Priority 4: Increase KD (over + oscillation persist) ───────
             if over_pct > 15.0 and osc > 4:
                 new_kd = round(min(kd + 0.015, _LIMITS["VKD"][1]), 3)
                 cmds[f"VKD {wi}"] = new_kd
@@ -715,10 +778,11 @@ class TestTuneNode(Node):
                     f"  {wn} [KD↑]: over {over_pct:.0f}%  osc {osc}"
                     f" → KD {kd:.3f} → {new_kd}  (damp)"
                 )
+                _record("KD↑")
                 any_suggestion = True
                 continue
 
-            # ── Priority 5: Reduce KI (KI may be causing overshoot) ───────
+            # ── Priority 5: Reduce KI (KI causing overshoot) ───────────────
             if ki > 0.0 and ss_err < 0.5 and over_pct > 10.0:
                 new_ki = round(max(ki * 0.7, 0.0), 3)
                 cmds[f"VKI {wi}"] = new_ki
@@ -726,10 +790,11 @@ class TestTuneNode(Node):
                     f"  {wn} [KI↓]: KI may cause over {over_pct:.0f}%"
                     f" → KI {ki:.3f} → {new_ki}"
                 )
+                _record("KI↓")
                 any_suggestion = True
                 continue
 
-            # ── Priority 6: Reduce KD (clean response, KD adding noise) ───
+            # ── Priority 6: Reduce KD (clean response, KD adding noise) ────
             if kd > 0.0 and osc <= 2 and over_pct < 5.0 and settle is not None:
                 new_kd = round(max(kd * 0.7, 0.0), 3)
                 cmds[f"VKD {wi}"] = new_kd
@@ -737,17 +802,40 @@ class TestTuneNode(Node):
                     f"  {wn} [KD↓]: clean response, reduce noise risk"
                     f" → KD {kd:.3f} → {new_kd}"
                 )
+                _record("KD↓")
                 any_suggestion = True
                 continue
 
-            # ── OK ─────────────────────────────────────────────────────────
-            settle_str = "NOT_SET" if settle is None else f"{settle:.2f}s"
-            rise_str   = "n/a"     if rise   is None else f"{rise:.2f}s"
-            msgs.append(
-                f"  {wn}: ✓  err {mean_err:.2f}  ss {ss_err:.2f}  "
-                f"over {over_pct:.0f}%  rise {rise_str}  settle {settle_str}"
-                f"  osc {osc}  wins {n_wins} — OK"
-            )
+            # ── OK — all criteria met ─────────────────────────────────────
+            # Strict OK: over% < 15%, either settled or (osc<=2 AND over%<10%), mean_err < 8
+            ok_settle = (settle is not None) or (osc <= 2 and over_pct < 10.0)
+            if over_pct < 15.0 and ok_settle and mean_err < 8.0:
+                settle_str = "NOT_SET" if settle is None else f"{settle:.2f}s"
+                rise_str   = "n/a"     if rise   is None else f"{rise:.2f}s"
+                msgs.append(
+                    f"  {wn}: ✓  err {mean_err:.2f}  ss {ss_err:.2f}  "
+                    f"over {over_pct:.0f}%  rise {rise_str}  settle {settle_str}"
+                    f"  osc {osc}  wins {n_wins} — OK"
+                )
+                _record("OK")
+            else:
+                # Not quite OK but no rule triggered cleanly — nudge KP slightly
+                effective_pct = 0.05
+                if over_pct >= 15.0:
+                    new_kp = round(max(kp * (1 - effective_pct), 0.5), 2)
+                    cmds[f"VKP {wi}"] = new_kp
+                    msgs.append(
+                        f"  {wn} [KP↓ gentle]: over {over_pct:.0f}%  settle={'n/s' if settle is None else f'{settle:.2f}s'}"
+                        f" → KP {kp:.2f} → {new_kp}  (−5%)"
+                    )
+                    _record("KP↓")
+                    any_suggestion = True
+                else:
+                    settle_str = "NOT_SET" if settle is None else f"{settle:.2f}s"
+                    msgs.append(
+                        f"  {wn}: ~ err {mean_err:.2f}  ss {ss_err:.2f}  "
+                        f"over {over_pct:.0f}%  settle {settle_str}  osc {osc}  — MARGINAL"
+                    )
 
         if not any_suggestion:
             msgs.append("\n  All wheels look good — no parameter changes suggested.")
@@ -761,6 +849,10 @@ class TestTuneNode(Node):
         Runs run_fn(*args), then shows velocity analysis and suggestions.
         Loops until user types 'done' or 'q'.
         """
+        # Reset suggestion history at the start of each new auto loop so that
+        # oscillation dampening does not carry state between different RPM tests.
+        self._suggest_history = [[], [], [], []]
+
         while True:
             self._auto_abort.clear()
             self._start_vel_poll()
