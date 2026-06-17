@@ -13,6 +13,7 @@ find_package(std_msgs REQUIRED)
 install(
   PROGRAMS
     scripts/comm_test.py
+    scripts/loop_images.py
     scripts/drive_client_node.py
     scripts/test_sequence_node.py
     scripts/navigation_node.py
