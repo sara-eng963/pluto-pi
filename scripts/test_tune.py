@@ -47,10 +47,11 @@ _LIMITS: dict[str, tuple[float, float]] = {
     "RTOL":    (0.2,  10.0),
     "FKP":     (0.0, 3000.0),
     "FMAXRPM": (1.0,  60.0),
-    "VKP":     (0.0,   5.0),
+    # Velocity PID — firmware defaults are 7-8, so allow up to 15
+    "VKP":     (0.0,  15.0),
     "VKI":     (0.0,   2.0),
     "VKD":     (0.0,   1.0),
-    "VKPALL":  (0.0,   5.0),
+    "VKPALL":  (0.0,  15.0),
     "VKIALL":  (0.0,   2.0),
     "VKDALL":  (0.0,   1.0),
 }
@@ -130,6 +131,18 @@ class TestTuneNode(Node):
         self.show_status  = False
         self.running      = True
 
+        # Velocity PID tracking — initialised to firmware defaults
+        # (WheelVelocityController.cpp order: R1=0, R2=1, F1=2, F2=3)
+        self._vkp_per_wheel: list[float] = [8.1, 7.6, 7.0, 7.8]
+        self._vki_per_wheel: list[float] = [0.13, 0.10, 0.08, 0.12]
+        self._vkd_per_wheel: list[float] = [0.0, 0.0, 0.0, 0.0]
+
+        # Velocity sample collection (filled during auto modes)
+        self._vel_samples: list[dict]              = []
+        self._collecting_vel: bool                 = False
+        self._vel_poll_stop                        = threading.Event()
+        self._vel_poll_thread: Optional[threading.Thread] = None
+
         print(MENU)
         print()
 
@@ -151,6 +164,11 @@ class TestTuneNode(Node):
             self._last_done = text
             self._fault_event.set()
 
+        if text.startswith("STATUS") and self._collecting_vel:
+            sample = self._parse_status_vel(text)
+            if sample:
+                self._vel_samples.append(sample)
+
         if text.startswith("STATUS") and not self.show_status:
             return
         print(f"\r\033[KESP> {text}\n> ", end="", flush=True)
@@ -162,6 +180,30 @@ class TestTuneNode(Node):
         msg.data = command.strip()
         self.drive_pub.publish(msg)
         print(f"→ {msg.data}")
+        # Track velocity PID parameter changes so suggestions use current values
+        parts = msg.data.upper().split()
+        if len(parts) >= 2:
+            v = self._float(parts[-1])
+            if v is None:
+                return
+            if parts[0] == "VKPALL":
+                self._vkp_per_wheel = [v] * 4
+            elif parts[0] == "VKIALL":
+                self._vki_per_wheel = [v] * 4
+            elif parts[0] == "VKDALL":
+                self._vkd_per_wheel = [v] * 4
+            elif parts[0] == "VKP" and len(parts) == 3 and parts[1].isdigit():
+                idx = int(parts[1])
+                if 0 <= idx <= 3:
+                    self._vkp_per_wheel[idx] = v
+            elif parts[0] == "VKI" and len(parts) == 3 and parts[1].isdigit():
+                idx = int(parts[1])
+                if 0 <= idx <= 3:
+                    self._vki_per_wheel[idx] = v
+            elif parts[0] == "VKD" and len(parts) == 3 and parts[1].isdigit():
+                idx = int(parts[1])
+                if 0 <= idx <= 3:
+                    self._vkd_per_wheel[idx] = v
 
     # ── Blocking send-and-wait (used by auto modes) ───────────────────────
 
@@ -254,6 +296,218 @@ class TestTuneNode(Node):
         print("  [prep] YAW zeroed")
         time.sleep(0.4)
         return True
+
+    # ── Velocity monitoring ───────────────────────────────────────────────
+
+    def _start_vel_poll(self) -> None:
+        self._vel_samples.clear()
+        self._vel_poll_stop.clear()
+        self._collecting_vel = True
+        self._vel_poll_thread = threading.Thread(
+            target=self._vel_poll_loop, daemon=True
+        )
+        self._vel_poll_thread.start()
+
+    def _stop_vel_poll(self) -> None:
+        self._vel_poll_stop.set()
+        self._collecting_vel = False
+        if self._vel_poll_thread is not None:
+            self._vel_poll_thread.join(timeout=1.0)
+            self._vel_poll_thread = None
+
+    def _vel_poll_loop(self) -> None:
+        """Background thread: publishes STATUS every 150 ms for vel data."""
+        while not self._vel_poll_stop.wait(timeout=0.15):
+            msg = String()
+            msg.data = "STATUS"
+            self.drive_pub.publish(msg)
+
+    @staticmethod
+    def _parse_csv_floats(text: str, prefix: str) -> Optional[list]:
+        for token in text.split():
+            if token.startswith(prefix + "="):
+                try:
+                    return [float(x) for x in token[len(prefix) + 1:].split(",")]
+                except ValueError:
+                    return None
+        return None
+
+    def _parse_status_vel(self, text: str) -> Optional[dict]:
+        target   = self._parse_csv_floats(text, "targetRPM")
+        measured = self._parse_csv_floats(text, "measuredRPM")
+        pwm      = self._parse_csv_floats(text, "pwm")
+        if target and measured and len(target) == 4 and len(measured) == 4:
+            return {"target": target, "measured": measured, "pwm": pwm or []}
+        return None
+
+    # ── Velocity analysis ─────────────────────────────────────────────────
+
+    def _analyze_vel(self) -> dict:
+        samples = self._vel_samples
+        ACTIVE_THR = 5.0
+        active = [s for s in samples
+                  if any(abs(t) > ACTIVE_THR for t in s["target"])]
+        result: dict = {
+            "total": len(samples), "active": len(active),
+            "mean_err": [0.0]*4, "max_overshoot": [0.0]*4,
+            "oscillations": [0]*4,
+            "mean_target": [0.0]*4, "mean_measured": [0.0]*4,
+        }
+        if not active:
+            return result
+        for wi in range(4):
+            wsamples = [s for s in active if abs(s["target"][wi]) > ACTIVE_THR]
+            if not wsamples:
+                continue
+            tgts = [s["target"][wi] for s in wsamples]
+            meas = [s["measured"][wi] for s in wsamples]
+            errs = [abs(t - m) for t, m in zip(tgts, meas)]
+            result["mean_target"][wi]   = sum(abs(t) for t in tgts) / len(tgts)
+            result["mean_measured"][wi] = sum(abs(m) for m in meas) / len(meas)
+            result["mean_err"][wi]      = sum(errs) / len(errs)
+            overs = [abs(m) - abs(t) for t, m in zip(tgts, meas)
+                     if abs(m) > abs(t) and abs(t) > ACTIVE_THR]
+            result["max_overshoot"][wi] = max(overs) if overs else 0.0
+            signed = [t - m for t, m in zip(tgts, meas)]
+            result["oscillations"][wi]  = sum(
+                1 for i in range(1, len(signed))
+                if signed[i] * signed[i - 1] < 0
+            )
+        return result
+
+    def _print_vel_report(self, a: dict) -> None:
+        print()
+        print(f"  ── VELOCITY LOOP ANALYSIS ─────────────────────────────")
+        print(f"  Samples: {a['active']} active / {a['total']} total")
+        if a["active"] < 3:
+            print(f"  Not enough active motion data.")
+            return
+        names = ["R1", "R2", "F1", "F2"]
+        print(f"\n  {'Whl':>4}  {'Target':>7}  {'Meas':>7}  {'MeanErr':>8}  {'MaxOver':>8}  {'Osc':>4}")
+        print(f"  {'─'*4}  {'─'*7}  {'─'*7}  {'─'*8}  {'─'*8}  {'─'*4}")
+        for wi, wn in enumerate(names):
+            print(f"  {wn:>4}  {a['mean_target'][wi]:>7.1f}  "
+                  f"{a['mean_measured'][wi]:>7.1f}  "
+                  f"{a['mean_err'][wi]:>8.2f}  "
+                  f"{a['max_overshoot'][wi]:>8.2f}  "
+                  f"{a['oscillations'][wi]:>4}")
+        avg_e = sum(a["mean_err"]) / 4
+        avg_o = sum(a["max_overshoot"]) / 4
+        print(f"  {'AVG':>4}  {'':>7}  {'':>7}  {avg_e:>8.2f}  {avg_o:>8.2f}")
+        print()
+
+    def _compute_vel_suggestions(self, a: dict) -> dict:
+        """
+        Per-wheel rule-based suggestions for VKP/VKI.
+        Each wheel is analysed independently — mecanum wheels behave differently
+        due to asymmetric load and different motor/encoder characteristics.
+        Returns dict with msgs (display) and cmds (esp command → value).
+        """
+        _WNAMES = ["R1", "R2", "F1", "F2"]
+
+        if a["active"] < 3:
+            return {"msgs": ["not enough active motion data"], "cmds": {}}
+
+        msgs: list[str] = []
+        cmds: dict[str, float] = {}   # key = "VKP 0" etc., value = float
+
+        any_suggestion = False
+
+        for wi, wn in enumerate(_WNAMES):
+            err  = a["mean_err"][wi]
+            over = a["max_overshoot"][wi]
+            osc  = a["oscillations"][wi]
+            kp   = self._vkp_per_wheel[wi]
+            ki   = self._vki_per_wheel[wi]
+
+            w_msgs: list[str] = []
+            new_kp = kp
+            new_ki = ki
+
+            # ── Overshoot or oscillation → reduce KP ─────────────────────
+            if over > 12.0 or osc > 8:
+                factor = 0.80 if over > 18.0 or osc > 14 else 0.88
+                new_kp = round(max(kp * factor, 0.5), 2)
+                cause = f"overshoot {over:.1f} RPM" if over > 12.0 else f"osc {osc}"
+                w_msgs.append(f"  {wn}: ⚠ {cause} → reduce KP {kp:.2f} → {new_kp}")
+
+            # ── High tracking error → increase KP ────────────────────────
+            elif err > 10.0:
+                new_kp = round(min(kp * 1.22, _LIMITS["VKP"][1]), 2)
+                w_msgs.append(f"  {wn}: ✗ err {err:.2f} RPM (high) → KP {kp:.2f} → {new_kp}")
+                if ki < 0.05:
+                    new_ki = round(min(ki + 0.03, _LIMITS["VKI"][1]), 3)
+                    w_msgs.append(f"       + KI {ki:.3f} → {new_ki}  (steady-state)")
+            elif err > 5.0:
+                new_kp = round(min(kp * 1.12, _LIMITS["VKP"][1]), 2)
+                w_msgs.append(f"  {wn}: ~ err {err:.2f} RPM (moderate) → KP {kp:.2f} → {new_kp}")
+            elif err > 2.0:
+                new_ki = round(min(ki + 0.02, _LIMITS["VKI"][1]), 3)
+                w_msgs.append(f"  {wn}: ~ err {err:.2f} RPM (small) → KI {ki:.3f} → {new_ki}")
+            else:
+                w_msgs.append(f"  {wn}: ✓ err {err:.2f} RPM — good")
+
+            msgs.extend(w_msgs)
+
+            if round(new_kp, 4) != round(kp, 4):
+                cmds[f"VKP {wi}"] = new_kp
+                any_suggestion = True
+            if round(new_ki, 4) != round(ki, 4):
+                cmds[f"VKI {wi}"] = new_ki
+                any_suggestion = True
+
+        if not any_suggestion:
+            msgs.append("\n  All wheels look good — no changes needed.")
+
+        return {"msgs": msgs, "cmds": cmds}
+
+    # ── Auto run loop (wraps auto methods with vel analysis + suggest) ─────
+
+    def _run_auto_loop(self, run_fn, *args) -> None:
+        """
+        Runs run_fn(*args), then shows velocity analysis and suggestions.
+        Loops until user types 'done' or 'q'.
+        """
+        while True:
+            self._auto_abort.clear()
+            self._start_vel_poll()
+            run_fn(*args)
+            self._stop_vel_poll()
+
+            if self._auto_abort.is_set():
+                break
+
+            analysis    = self._analyze_vel()
+            self._print_vel_report(analysis)
+            suggestion  = self._compute_vel_suggestions(analysis)
+
+            print(f"  ── SUGGESTIONS ─────────────────────────────────────")
+            for m in suggestion["msgs"]:
+                print(f"  {m}")
+            print()
+
+            has_cmds = bool(suggestion.get("cmds"))
+            prompt = (
+                "  [ok=apply+rerun  skip=rerun  done=stop  q=quit] > "
+                if has_cmds else
+                "  [skip=rerun  done=stop  q=quit] > "
+            )
+            try:
+                resp = input(prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                break
+
+            if resp == "q":
+                self.running = False
+                rclpy.shutdown()
+                return
+            if resp == "done":
+                break
+            if resp == "ok" and has_cmds:
+                for cmd, val in suggestion["cmds"].items():
+                    self._send(f"{cmd} {val:.6g}")
+                    time.sleep(0.08)
+            # "ok" or "skip": continue loop (rerun with new or same params)
 
     # ── AUTO ROT ─────────────────────────────────────────────────────────
 
@@ -476,17 +730,17 @@ class TestTuneNode(Node):
                 if not (1.0 <= abs(val) <= 180.0):
                     print("angle must be 1–180°")
                     return
-                self._auto_rotate(val, cnt)
+                self._run_auto_loop(self._auto_rotate, val, cnt)
             elif mode == "MOVE":
                 if abs(val) > 3.0:
                     print("distance > 3 m blocked")
                     return
-                self._auto_move(val, cnt)
+                self._run_auto_loop(self._auto_move, val, cnt)
             elif mode == "TRIP":
                 if abs(val) > 3.0:
                     print("distance > 3 m blocked")
                     return
-                self._auto_trip(val, cnt)
+                self._run_auto_loop(self._auto_trip, val, cnt)
             else:
                 print(f"unknown auto mode '{mode}'  (ROT / MOVE / TRIP)")
             return

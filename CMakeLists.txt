@@ -22,6 +22,7 @@ install(
     scripts/mission_node.py
     scripts/test_camera.py
     scripts/test_pid.py
+    scripts/test_tune.py
     scripts/rfid_node.py
     scripts/gui_node.py
     scripts/test_mfrc522_spi.py
