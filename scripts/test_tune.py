@@ -1252,20 +1252,21 @@ class TestTuneNode(Node):
 
         # ── Wheel velocity gains ──────────────────────────────────────
         if verb in (*_WHEEL_IDX, "ALL") and len(parts) == 3 and parts[1] in ("KP", "KI", "KD"):
-            gain = parts[1]
+            gain = parts[1]          # "KP" / "KI" / "KD"
+            letter = gain[1:]        # "P"  / "I"  / "D"  — matches ESP command prefix
             val  = self._float(parts[2])
             if val is None:
                 print("invalid value")
                 return
-            limit_key = f"VK{gain}ALL" if verb == "ALL" else f"VK{gain}"
+            limit_key = f"VK{letter}ALL" if verb == "ALL" else f"VK{letter}"
             err = self._check_limit(limit_key, val)
             if err:
                 print(f"BLOCKED: {err}")
                 return
             if verb == "ALL":
-                self._send(f"VK{gain}ALL {val:.6g}")
+                self._send(f"VK{letter}ALL {val:.6g}")
             else:
-                self._send(f"VK{gain} {_WHEEL_IDX[verb]} {val:.6g}")
+                self._send(f"VK{letter} {_WHEEL_IDX[verb]} {val:.6g}")
             return
 
         print("unknown command — type 'help'")
