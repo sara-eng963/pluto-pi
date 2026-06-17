@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -12,7 +13,9 @@ class MissionNode(Node):
     def __init__(self):
         super().__init__("mission_node")
 
-        self.REQUIRED_VALID_READINGS = 3
+        self.REQUIRED_VALID_READINGS = 8   # total samples to collect
+        self.VISION_MIN_TRUE = 6            # how many must be True to pass
+        self.VISION_STABILIZE_SEC = 1.5     # ignore readings for this long after arriving
 
         # Mission/order state
         self.mission_state = "idle"
@@ -30,6 +33,7 @@ class MissionNode(Node):
         self.latest_valid = False
         self.valid_reading_count = 0
         self.valid_true_count = 0
+        self.vision_check_start_time = 0.0
         self.latest_detected_fruit = ""
         self.waiting_for_valid = False
         self.storage_done_for_current_target = False
@@ -498,6 +502,13 @@ class MissionNode(Node):
         if msg.data:
             self.valid_true_count += 1
 
+        # Ignore readings until the robot has had time to physically settle.
+        if (time.time() - self.vision_check_start_time) < self.VISION_STABILIZE_SEC:
+            self.valid_reading_count -= 1
+            if msg.data:
+                self.valid_true_count -= 1
+            return
+
         self.get_logger().info(
             f"Vision valid sample {self.valid_reading_count}/{self.REQUIRED_VALID_READINGS}: {msg.data}"
         )
@@ -505,7 +516,7 @@ class MissionNode(Node):
         if self.valid_reading_count < self.REQUIRED_VALID_READINGS:
             return
 
-        if self.valid_true_count == self.REQUIRED_VALID_READINGS:
+        if self.valid_true_count >= self.VISION_MIN_TRUE:
             self.mission_state = "storing"
             self._publish_mission_state()
             self._publish_mission_event(
@@ -523,7 +534,9 @@ class MissionNode(Node):
             return
 
         self.get_logger().warn(
-            f"Vision failed after {self.REQUIRED_VALID_READINGS} readings: {self.valid_true_count} true."
+            f"Vision failed after {self.REQUIRED_VALID_READINGS} readings: "
+            f"{self.valid_true_count}/{self.REQUIRED_VALID_READINGS} true "
+            f"(need {self.VISION_MIN_TRUE})."
         )
         self._handle_vision_fail()
 
@@ -731,6 +744,7 @@ class MissionNode(Node):
 
             self.waiting_for_valid = True
             self._reset_valid_readings()
+            self.vision_check_start_time = time.time()
             self.storage_done_for_current_target = False
             self.get_logger().info(
                 f"Reached fruit target. Waiting for {self.REQUIRED_VALID_READINGS} fresh /valid readings."
