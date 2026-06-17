@@ -94,9 +94,14 @@ Wheel velocity PID  (wheel = R1 R2 F1 F2):
              R1=rear-right   R2=rear-left
 
 Automatic test modes:
-  AUTO ROT  <angle_deg> [count=5]   repeated rotate to angle and back
-  AUTO MOVE <dist_m>    [count=3]   repeated forward + back move
-  AUTO TRIP <dist_m>    [count=3]   full Manhattan round-trip
+  AUTO VTEST <rpm> [duration_ms=2000]   PRIMARY source for wheel velocity PID tuning.
+                                         Clean step-input; all wheels at <rpm> for <ms>.
+                                         Metrics (rise/settle/overshoot/SS/osc) are valid.
+  AUTO ROT  <angle_deg> [count=5]       Full-robot rotation validation (not for vel PID).
+  AUTO MOVE <dist_m>    [count=3]       Full-robot move validation   (not for vel PID).
+  AUTO TRIP <dist_m>    [count=3]       Full round-trip validation.
+
+  VTEST <rpm> [duration_ms]            One-shot step test (no analysis loop).
 
   Type ABORT (or Ctrl-C) to stop any auto sequence.
 
@@ -237,7 +242,7 @@ class TestTuneNode(Node):
             return None, False
 
         verb = command.strip().upper().split()[0]
-        if verb not in ("MOVE", "ROTATE"):
+        if verb not in ("MOVE", "ROTATE", "VTEST"):
             return self._last_esp, True
 
         # wait for DONE
@@ -347,108 +352,221 @@ class TestTuneNode(Node):
 
     # ── Velocity analysis ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _find_stable_windows(
+        samples: list,
+        wi: int,
+        min_dur: float = 0.5,
+        max_delta: float = 3.0,
+        active_thr: float = 5.0,
+    ) -> list:
+        """
+        Find contiguous windows where target[wi] is stable:
+          - abs(target[wi]) > active_thr
+          - consecutive target changes < max_delta RPM
+          - window duration >= min_dur seconds
+
+        Returns a list of windows; each window is a list of sample dicts.
+        These are the only windows valid for SS-error, overshoot, settling-time,
+        and oscillation analysis (MOVE ramps up/down and would corrupt all of
+        those metrics if included).
+        """
+        windows: list = []
+        current: list = []
+
+        for s in samples:
+            tgt = abs(s["target"][wi])
+
+            if tgt <= active_thr:
+                # Target inactive — close any open window
+                if current:
+                    dur = current[-1]["t"] - current[0]["t"]
+                    if dur >= min_dur:
+                        windows.append(current)
+                    current = []
+                continue
+
+            if current:
+                prev_tgt = abs(current[-1]["target"][wi])
+                if abs(tgt - prev_tgt) < max_delta:
+                    current.append(s)
+                else:
+                    # Significant target change — close old window, start new
+                    dur = current[-1]["t"] - current[0]["t"]
+                    if dur >= min_dur:
+                        windows.append(current)
+                    current = [s]
+            else:
+                current = [s]
+
+        if current:
+            dur = current[-1]["t"] - current[0]["t"]
+            if dur >= min_dur:
+                windows.append(current)
+
+        return windows
+
     def _analyze_vel(self) -> dict:
         """
-        Per-wheel time-domain and steady-state analysis.
+        Per-wheel time-domain and steady-state analysis using stable-target windows.
 
-        Metrics computed per wheel:
-          mean_err       — mean |target - measured| over all active samples
-          ss_error       — steady-state error: mean error in last 25% of active samples
-          max_overshoot  — peak (measured - target) when target is positive
-          overshoot_pct  — max_overshoot as % of target
-          rise_time_s    — time for measured to go from 10% to 90% of target
-                           at the very first activation burst (None if n/a)
-          settling_time_s— time until measured stays within ±15% of target (None if n/a)
-          oscillations   — number of tracking-error sign changes
+        Metrics per wheel:
+          mean_err        — mean |target-measured| over all active (non-zero target) samples
+          ss_error        — steady-state error from last 25 % of each stable window
+          max_overshoot   — peak (|measured|-|target|) inside stable windows only
+          overshoot_pct   — max_overshoot as % of mean target inside stable windows
+          rise_time_s     — 10→90 % rise time inside the first stable window
+          settling_time_s — first time wheel stays in ±15 % until end of each window
+                            (None/NOT_SETTLED if it never settles in any window)
+          oscillations    — sign changes in tracking error with ±2 RPM deadband
+          stable_windows  — number of stable-target windows found
         """
         samples = self._vel_samples
-        ACTIVE_THR = 5.0
-        BAND = 0.15           # ±15% settling band
-        POLL_DT = 0.15        # approximate sample interval (s)
+        ACTIVE_THR  = 5.0   # RPM — below this target is considered "off"
+        BAND        = 0.15  # ±15 % settling band
+        OSC_DEADBAND = 2.0  # RPM — ignore sign changes smaller than this
 
         active = [s for s in samples
                   if any(abs(t) > ACTIVE_THR for t in s["target"])]
 
         result: dict = {
-            "total": len(samples), "active": len(active),
-            "mean_err":       [0.0] * 4,
-            "ss_error":       [0.0] * 4,
-            "max_overshoot":  [0.0] * 4,
-            "overshoot_pct":  [0.0] * 4,
+            "total":          len(samples),
+            "active":         len(active),
+            "mean_err":       [0.0]  * 4,
+            "ss_error":       [0.0]  * 4,
+            "max_overshoot":  [0.0]  * 4,
+            "overshoot_pct":  [0.0]  * 4,
             "rise_time_s":    [None] * 4,
             "settling_time_s":[None] * 4,
-            "oscillations":   [0]   * 4,
-            "mean_target":    [0.0] * 4,
-            "mean_measured":  [0.0] * 4,
+            "oscillations":   [0]    * 4,
+            "mean_target":    [0.0]  * 4,
+            "mean_measured":  [0.0]  * 4,
+            "stable_windows": [0]    * 4,
         }
 
         if not active:
             return result
 
-        t0 = active[0]["t"]   # reference time for this burst
-
         for wi in range(4):
-            wsamples = [s for s in active if abs(s["target"][wi]) > ACTIVE_THR]
-            if not wsamples:
+            # ── Global stats (all active samples) ─────────────────────
+            wa = [s for s in active if abs(s["target"][wi]) > ACTIVE_THR]
+            if not wa:
                 continue
 
-            tgts = [s["target"][wi]   for s in wsamples]
-            meas = [s["measured"][wi] for s in wsamples]
-            ts   = [s["t"]            for s in wsamples]
-            errs = [abs(t - m) for t, m in zip(tgts, meas)]
+            tgts_all = [s["target"][wi]   for s in wa]
+            meas_all = [s["measured"][wi] for s in wa]
+            errs_all = [abs(t - m) for t, m in zip(tgts_all, meas_all)]
 
-            result["mean_target"][wi]   = sum(abs(t) for t in tgts) / len(tgts)
-            result["mean_measured"][wi] = sum(abs(m) for m in meas) / len(meas)
-            result["mean_err"][wi]      = sum(errs) / len(errs)
+            result["mean_target"][wi]   = sum(abs(t) for t in tgts_all) / len(tgts_all)
+            result["mean_measured"][wi] = sum(abs(m) for m in meas_all) / len(meas_all)
+            result["mean_err"][wi]      = sum(errs_all) / len(errs_all)
 
-            # Steady-state error: last 25% of samples (robot moving at constant speed)
-            tail = max(1, len(wsamples) // 4)
-            ss_errs = errs[-tail:]
-            result["ss_error"][wi] = sum(ss_errs) / len(ss_errs)
+            # ── Stable-window analysis ────────────────────────────────
+            windows = self._find_stable_windows(samples, wi)
+            result["stable_windows"][wi] = len(windows)
 
-            # Overshoot: peak (|measured| - |target|) when both positive
-            overs = [abs(m) - abs(t) for t, m in zip(tgts, meas)
-                     if abs(m) > abs(t) and abs(t) > ACTIVE_THR]
-            peak_over = max(overs) if overs else 0.0
-            result["max_overshoot"][wi] = peak_over
-            avg_tgt = result["mean_target"][wi]
-            result["overshoot_pct"][wi] = (peak_over / avg_tgt * 100.0
-                                           if avg_tgt > 0 else 0.0)
-
-            # Rise time: 10% → 90% of target at first activation
-            abs_tgt  = [abs(t) for t in tgts]
-            abs_meas = [abs(m) for m in meas]
-            peak_tgt = max(abs_tgt) if abs_tgt else 0.0
-            if peak_tgt > ACTIVE_THR:
-                t10 = peak_tgt * 0.10
-                t90 = peak_tgt * 0.90
-                idx10 = next((i for i, m in enumerate(abs_meas) if m >= t10), None)
-                idx90 = next((i for i, m in enumerate(abs_meas) if m >= t90), None)
-                if idx10 is not None and idx90 is not None and idx90 > idx10:
-                    result["rise_time_s"][wi] = round(
-                        (ts[idx90] - ts[idx10]), 2
-                    )
-
-            # Settling time: last sample outside ±15% band, measured from start
-            settled = True
-            last_unsettled = None
-            for i, (t_, m_) in enumerate(zip(tgts, meas)):
-                if abs(t_) > ACTIVE_THR:
-                    if abs(m_ - t_) > BAND * abs(t_):
-                        last_unsettled = i
-                        settled = False
-            if last_unsettled is not None and ts:
-                result["settling_time_s"][wi] = round(
-                    ts[last_unsettled] - t0, 2
+            if not windows:
+                # No stable window — fall back to last-25 % for SS error only
+                tail = max(1, len(wa) // 4)
+                result["ss_error"][wi] = sum(errs_all[-tail:]) / tail
+                # Oscillations with deadband on all active samples
+                signed = [t - m for t, m in zip(tgts_all, meas_all)]
+                result["oscillations"][wi] = sum(
+                    1 for i in range(1, len(signed))
+                    if abs(signed[i]) > OSC_DEADBAND
+                    and abs(signed[i - 1]) > OSC_DEADBAND
+                    and signed[i] * signed[i - 1] < 0
                 )
-            elif settled and ts:
-                result["settling_time_s"][wi] = 0.0
+                continue
 
-            # Oscillations: sign changes in tracking error
-            signed = [t - m for t, m in zip(tgts, meas)]
+            all_ss_errs: list[float]       = []
+            all_overshoots: list[float]    = []
+            rise_times: list[float]        = []
+            settling_times: list           = []   # float or None per window
+            all_osc_signed: list[float]    = []
+
+            for win in windows:
+                w_tgts = [s["target"][wi]   for s in win]
+                w_meas = [s["measured"][wi] for s in win]
+                w_ts   = [s["t"]            for s in win]
+                w_errs = [abs(t - m) for t, m in zip(w_tgts, w_meas)]
+
+                # Steady-state error: last 25 % of this stable window
+                tail = max(1, len(win) // 4)
+                all_ss_errs.extend(w_errs[-tail:])
+
+                # Overshoot: |measured| exceeds |target| inside stable window
+                # (this excludes deceleration ramps that precede the window)
+                for t_, m_ in zip(w_tgts, w_meas):
+                    excess = abs(m_) - abs(t_)
+                    if excess > 0:
+                        all_overshoots.append(excess)
+
+                # Rise time: 10 % → 90 % inside the first stable window only
+                if not rise_times:
+                    abs_tgt  = [abs(t) for t in w_tgts]
+                    abs_meas = [abs(m) for m in w_meas]
+                    pk = max(abs_tgt) if abs_tgt else 0.0
+                    if pk > ACTIVE_THR:
+                        t10, t90 = pk * 0.10, pk * 0.90
+                        idx10 = next((i for i, m in enumerate(abs_meas) if m >= t10), None)
+                        idx90 = next((i for i, m in enumerate(abs_meas) if m >= t90), None)
+                        if idx10 is not None and idx90 is not None and idx90 > idx10:
+                            rise_times.append(round(w_ts[idx90] - w_ts[idx10], 3))
+
+                # Settling time: first index from which ALL subsequent samples
+                # in this window stay within ±BAND of target.
+                # Returns None if wheel never settles during this window.
+                w_t0 = w_ts[0]
+                n = len(win)
+                settled_at = None
+                for i in range(n):
+                    if abs(w_tgts[i]) <= ACTIVE_THR:
+                        continue
+                    all_in_band = all(
+                        abs(abs(w_meas[j]) - abs(w_tgts[j])) <= BAND * abs(w_tgts[j])
+                        for j in range(i, n)
+                        if abs(w_tgts[j]) > ACTIVE_THR
+                    )
+                    if all_in_band:
+                        settled_at = round(w_ts[i] - w_t0, 3)
+                        break
+                settling_times.append(settled_at)
+
+                # Oscillation signed errors for this window
+                all_osc_signed.extend([t - m for t, m in zip(w_tgts, w_meas)])
+
+            # Aggregate SS error
+            if all_ss_errs:
+                result["ss_error"][wi] = sum(all_ss_errs) / len(all_ss_errs)
+
+            # Overshoot
+            if all_overshoots:
+                pk_over = max(all_overshoots)
+                result["max_overshoot"][wi] = pk_over
+                avg_tgt = result["mean_target"][wi]
+                result["overshoot_pct"][wi] = (
+                    pk_over / avg_tgt * 100.0 if avg_tgt > 0 else 0.0
+                )
+
+            # Rise time (first window only)
+            if rise_times:
+                result["rise_time_s"][wi] = rise_times[0]
+
+            # Settling time: report worst-case settled time;
+            # if ANY window never settled → NOT_SETTLED (None)
+            settled_vals = [s for s in settling_times if s is not None]
+            if len(settled_vals) == len(settling_times) and settled_vals:
+                result["settling_time_s"][wi] = max(settled_vals)
+            else:
+                result["settling_time_s"][wi] = None  # never settled in ≥1 window
+
+            # Oscillations with ±OSC_DEADBAND deadband
             result["oscillations"][wi] = sum(
-                1 for i in range(1, len(signed))
-                if signed[i] * signed[i - 1] < 0
+                1 for i in range(1, len(all_osc_signed))
+                if abs(all_osc_signed[i])     > OSC_DEADBAND
+                and abs(all_osc_signed[i - 1]) > OSC_DEADBAND
+                and all_osc_signed[i] * all_osc_signed[i - 1] < 0
             )
 
         return result
@@ -456,7 +574,12 @@ class TestTuneNode(Node):
     def _print_vel_report(self, a: dict) -> None:
         print()
         print(f"  ── VELOCITY LOOP ANALYSIS ─────────────────────────────")
-        print(f"  Samples: {a['active']} active / {a['total']} total")
+        wins_str = "  ".join(
+            f"{n}:{a['stable_windows'][i]}w"
+            for i, n in enumerate(["R1", "R2", "F1", "F2"])
+        )
+        print(f"  Samples: {a['active']} active / {a['total']} total  "
+              f"stable-windows: {wins_str}")
         if a["active"] < 3:
             print(f"  Not enough active motion data.")
             return
@@ -464,14 +587,16 @@ class TestTuneNode(Node):
 
         hdr = (f"  {'Whl':>4}  {'Target':>7}  {'Meas':>7}  "
                f"{'MeanErr':>8}  {'SSErr':>6}  "
-               f"{'Over%':>6}  {'Rise':>6}  {'Settle':>7}  {'Osc':>4}")
+               f"{'Over%':>6}  {'Rise':>6}  {'Settle':>8}  {'Osc':>4}")
         print(f"\n{hdr}")
         print("  " + "─" * (len(hdr) - 2))
 
         def _fmt(v, fmt):
-            return "n/a" if v is None else format(v, fmt)
+            return "NO_SET" if v is None else format(v, fmt)
 
         for wi, wn in enumerate(names):
+            settle_s = a["settling_time_s"][wi]
+            settle_str = "NOT_SET" if settle_s is None else f"{settle_s:8.2f}"
             print(
                 f"  {wn:>4}  "
                 f"{a['mean_target'][wi]:>7.1f}  "
@@ -479,8 +604,8 @@ class TestTuneNode(Node):
                 f"{a['mean_err'][wi]:>8.2f}  "
                 f"{a['ss_error'][wi]:>6.2f}  "
                 f"{a['overshoot_pct'][wi]:>6.1f}  "
-                f"{_fmt(a['rise_time_s'][wi], '6.2f')}  "
-                f"{_fmt(a['settling_time_s'][wi], '7.2f')}  "
+                f"{_fmt(a['rise_time_s'][wi], '6.3f')}  "
+                f"{settle_str}  "
                 f"{a['oscillations'][wi]:>4}"
             )
 
@@ -489,22 +614,27 @@ class TestTuneNode(Node):
         avg_op = sum(a["overshoot_pct"]) / 4
         print(f"  {'AVG':>4}  {'':>7}  {'':>7}  "
               f"{avg_e:>8.2f}  {avg_ss:>6.2f}  {avg_op:>6.1f}")
-        print(f"\n  MeanErr=mean tracking err(RPM)  SSErr=steady-state err  "
-              f"Over%=peak overshoot  Rise=10→90% time(s)  Settle=settle time(s)")
+        print(
+            f"\n  MeanErr=all-active err(RPM)  SSErr=stable-window SS err  "
+            f"Over%=stable-window overshoot  Rise=10→90%(s)  "
+            f"Settle=first-settled(s)/NOT_SET  Osc=deadband sign-changes"
+        )
         print()
 
     def _compute_vel_suggestions(self, a: dict) -> dict:
         """
-        Per-wheel PID suggestions using time-domain + steady-state metrics.
-        Each wheel analysed independently (mecanum wheels differ in load/friction).
+        Per-wheel PID suggestions — ONE parameter type per wheel per cycle.
 
-        Rules applied per wheel:
-          KP ↑  slow rise (>0.8s) and no overshoot
-          KP ↓  overshoot% >25% or oscillation + long settle
-          KI ↑  steady-state error >1.5 RPM after acceptable transient
-          KI ↓  KI causing overshoot (ss_err good but over% high)
-          KD ↑  overshoot% >15% AND oscillations >4  (derivative damping)
-          KD ↓  KD already set, oscillations low (may be amplifying noise)
+        Priority order (applied strictly; only the first matching rule fires):
+          1. KP ↓  — unstable / overshooting  (over% > 25 OR osc > 6 with no settle)
+          2. KP ↑  — slow / lagging            (rise > 0.8 s or mean_err > 10, no over)
+          3. KI ↑  — persistent SS error       (ss_err > 1.5 RPM, transient already OK)
+          4. KD ↑  — over + oscillation remain (over% > 15 AND osc > 4)
+          5. KI ↓  — KI suspected of causing overshoot  (over% high, ss_err low)
+          6. KD ↓  — KD adding noise, clean response
+          7. OK    — no change recommended
+
+        Only ONE of KP / KI / KD is suggested per wheel per call.
         """
         _WNAMES = ["R1", "R2", "F1", "F2"]
 
@@ -522,69 +652,102 @@ class TestTuneNode(Node):
             rise     = a["rise_time_s"][wi]
             settle   = a["settling_time_s"][wi]
             osc      = a["oscillations"][wi]
+            n_wins   = a["stable_windows"][wi]
 
             kp = self._vkp_per_wheel[wi]
             ki = self._vki_per_wheel[wi]
             kd = self._vkd_per_wheel[wi]
-            new_kp, new_ki, new_kd = kp, ki, kd
-            w_msgs: list[str] = []
 
-            # ── KP ────────────────────────────────────────────────────────
-            if over_pct > 25.0 or (settle is not None and settle > 3.0 and osc > 6):
-                factor = 0.78 if over_pct > 35.0 or osc > 10 else 0.87
+            # ── Priority 1: Reduce KP (unstable / overshooting) ──────────
+            if over_pct > 25.0 or (settle is None and osc > 6 and n_wins > 0):
+                factor = 0.78 if over_pct > 40.0 or osc > 12 else 0.87
                 new_kp = round(max(kp * factor, 0.5), 2)
-                w_msgs.append(f"  {wn}: ⚠ over {over_pct:.0f}% osc {osc} "
-                               f"→ KP {kp:.2f}→{new_kp} (↓{100*(1-factor):.0f}%)")
-            elif rise is not None and rise > 0.8 and over_pct < 10.0:
-                new_kp = round(min(kp * 1.18, _LIMITS["VKP"][1]), 2)
-                w_msgs.append(f"  {wn}: ⏱ rise {rise:.2f}s slow "
-                               f"→ KP {kp:.2f}→{new_kp} (+18%)")
-            elif mean_err > 10.0 and over_pct < 15.0:
-                new_kp = round(min(kp * 1.20, _LIMITS["VKP"][1]), 2)
-                w_msgs.append(f"  {wn}: ✗ err {mean_err:.1f}RPM high "
-                               f"→ KP {kp:.2f}→{new_kp} (+20%)")
-            elif mean_err > 5.0 and over_pct < 15.0:
+                cmds[f"VKP {wi}"] = new_kp
+                msgs.append(
+                    f"  {wn} [KP↓]: over {over_pct:.0f}%  osc {osc}  settle={'n/s' if settle is None else f'{settle:.2f}s'}"
+                    f" → KP {kp:.2f} → {new_kp}  (↓{100*(1-factor):.0f}%)"
+                )
+                any_suggestion = True
+                continue
+
+            # ── Priority 2: Increase KP (slow rise / high tracking error) ─
+            if (rise is not None and rise > 0.8 and over_pct < 10.0) or \
+               (mean_err > 10.0 and over_pct < 15.0):
+                factor = 1.20 if mean_err > 10.0 else 1.15
+                new_kp = round(min(kp * factor, _LIMITS["VKP"][1]), 2)
+                reason = (f"rise {rise:.2f}s" if rise is not None and rise > 0.8
+                          else f"err {mean_err:.1f} RPM")
+                cmds[f"VKP {wi}"] = new_kp
+                msgs.append(
+                    f"  {wn} [KP↑]: {reason}"
+                    f" → KP {kp:.2f} → {new_kp}  (+{100*(factor-1):.0f}%)"
+                )
+                any_suggestion = True
+                continue
+
+            if mean_err > 5.0 and over_pct < 15.0:
                 new_kp = round(min(kp * 1.10, _LIMITS["VKP"][1]), 2)
-                w_msgs.append(f"  {wn}: ~ err {mean_err:.1f}RPM moderate "
-                               f"→ KP {kp:.2f}→{new_kp} (+10%)")
+                cmds[f"VKP {wi}"] = new_kp
+                msgs.append(
+                    f"  {wn} [KP↑]: err {mean_err:.1f} RPM moderate"
+                    f" → KP {kp:.2f} → {new_kp}  (+10%)"
+                )
+                any_suggestion = True
+                continue
 
-            # ── KI ────────────────────────────────────────────────────────
+            # ── Priority 3: Increase KI (persistent SS error) ─────────────
             transient_ok = (rise is None or rise < 1.0) and over_pct < 15.0
-            if transient_ok and ss_err > 1.5 and ki < 0.5:
+            if transient_ok and ss_err > 1.5 and ki < 0.5 and n_wins > 0:
                 new_ki = round(min(ki + 0.03, _LIMITS["VKI"][1]), 3)
-                w_msgs.append(f"  {wn}: → SS {ss_err:.2f}RPM persists "
-                               f"→ KI {ki:.3f}→{new_ki}")
-            elif ki > 0.0 and ss_err < 0.5 and over_pct > 10.0:
-                new_ki = round(max(ki * 0.7, 0.0), 3)
-                w_msgs.append(f"  {wn}: ⚠ KI may cause overshoot "
-                               f"→ KI {ki:.3f}→{new_ki}")
+                cmds[f"VKI {wi}"] = new_ki
+                msgs.append(
+                    f"  {wn} [KI↑]: SS {ss_err:.2f} RPM (from {n_wins} window(s))"
+                    f" → KI {ki:.3f} → {new_ki}"
+                )
+                any_suggestion = True
+                continue
 
-            # ── KD ────────────────────────────────────────────────────────
+            # ── Priority 4: Increase KD (over + oscillation persist) ──────
             if over_pct > 15.0 and osc > 4:
                 new_kd = round(min(kd + 0.015, _LIMITS["VKD"][1]), 3)
-                w_msgs.append(f"  {wn}: ↓ over {over_pct:.0f}% + osc {osc} "
-                               f"→ KD {kd:.3f}→{new_kd} (damp)")
-            elif kd > 0.0 and osc <= 2 and over_pct < 5.0:
-                new_kd = round(max(kd * 0.7, 0.0), 3)
-                w_msgs.append(f"  {wn}: ~ KD may amplify noise "
-                               f"→ KD {kd:.3f}→{new_kd} (reduce)")
-
-            if not w_msgs:
-                w_msgs.append(f"  {wn}: ✓ err {mean_err:.2f}  ss {ss_err:.2f}  "
-                               f"rise {'n/a' if rise is None else f'{rise:.2f}s'}  "
-                               f"over {over_pct:.0f}% — OK")
-
-            msgs.extend(w_msgs)
-
-            if round(new_kp, 4) != round(kp, 4):
-                cmds[f"VKP {wi}"] = new_kp
-                any_suggestion = True
-            if round(new_ki, 4) != round(ki, 4):
-                cmds[f"VKI {wi}"] = new_ki
-                any_suggestion = True
-            if round(new_kd, 4) != round(kd, 4):
                 cmds[f"VKD {wi}"] = new_kd
+                msgs.append(
+                    f"  {wn} [KD↑]: over {over_pct:.0f}%  osc {osc}"
+                    f" → KD {kd:.3f} → {new_kd}  (damp)"
+                )
                 any_suggestion = True
+                continue
+
+            # ── Priority 5: Reduce KI (KI may be causing overshoot) ───────
+            if ki > 0.0 and ss_err < 0.5 and over_pct > 10.0:
+                new_ki = round(max(ki * 0.7, 0.0), 3)
+                cmds[f"VKI {wi}"] = new_ki
+                msgs.append(
+                    f"  {wn} [KI↓]: KI may cause over {over_pct:.0f}%"
+                    f" → KI {ki:.3f} → {new_ki}"
+                )
+                any_suggestion = True
+                continue
+
+            # ── Priority 6: Reduce KD (clean response, KD adding noise) ───
+            if kd > 0.0 and osc <= 2 and over_pct < 5.0 and settle is not None:
+                new_kd = round(max(kd * 0.7, 0.0), 3)
+                cmds[f"VKD {wi}"] = new_kd
+                msgs.append(
+                    f"  {wn} [KD↓]: clean response, reduce noise risk"
+                    f" → KD {kd:.3f} → {new_kd}"
+                )
+                any_suggestion = True
+                continue
+
+            # ── OK ─────────────────────────────────────────────────────────
+            settle_str = "NOT_SET" if settle is None else f"{settle:.2f}s"
+            rise_str   = "n/a"     if rise   is None else f"{rise:.2f}s"
+            msgs.append(
+                f"  {wn}: ✓  err {mean_err:.2f}  ss {ss_err:.2f}  "
+                f"over {over_pct:.0f}%  rise {rise_str}  settle {settle_str}"
+                f"  osc {osc}  wins {n_wins} — OK"
+            )
 
         if not any_suggestion:
             msgs.append("\n  All wheels look good — no parameter changes suggested.")
@@ -807,6 +970,62 @@ class TestTuneNode(Node):
                   f"max: {max(move_times):.1f}s")
         print()
 
+    # ── AUTO VTEST ───────────────────────────────────────────────────────
+
+    def _auto_vtest(self, rpm: float, duration_ms: int) -> None:
+        """
+        Dedicated wheel-velocity step test using the VTEST firmware command.
+
+        All wheels are commanded to `rpm` simultaneously for `duration_ms`.
+        This is a clean step-input so all velocity PID metrics (rise, settle,
+        overshoot, SS error, oscillations) are valid — unlike MOVE where
+        target RPM ramps up/down with position PID.
+        """
+        self._auto_abort.clear()
+        dur_s = duration_ms / 1000.0
+        print(f"\n  AUTO VTEST  rpm={rpm:.1f}  duration={duration_ms}ms  "
+              f"(type ABORT to stop)\n")
+
+        if not self._safe_reset_zero():
+            return
+
+        print(f"  Sending VTEST {rpm:.1f} {duration_ms} ...")
+        done_timeout = dur_s + 5.0   # firmware runs for duration_ms then sends DONE
+        done_text, ok = self._send_and_wait(
+            f"VTEST {rpm:.1f} {duration_ms}",
+            ack_timeout=_ACK_TIMEOUT,
+            done_timeout=done_timeout,
+        )
+
+        if not ok:
+            print(f"  ✗ VTEST did not complete cleanly: {done_text}")
+            return
+
+        print(f"  VTEST complete: {done_text}")
+        time.sleep(0.1)
+
+    # ── Scoring stubs (future: position / heading / rotate / final-yaw PID) ─
+    #
+    # TODO: implement _analyze_position() — metrics from AUTO MOVE runs:
+    #   - final_dist_err_m    : |currentDistance - targetDistance| at DONE
+    #   - overshoot_dist_m    : peak distance beyond target during approach
+    #   - move_timeout        : True if MOVE FAULT TIMEOUT
+    #   - stop_smoothness     : velocity jerk in last 200 ms (low = smooth stop)
+    #
+    # TODO: implement _analyze_heading() — metrics from straight MOVE runs:
+    #   - rms_yaw_err_deg     : RMS of heading error sampled during MOVE
+    #   - max_yaw_dev_deg     : peak heading deviation from commanded direction
+    #
+    # TODO: implement _analyze_rotate() — metrics from AUTO ROT runs:
+    #   - final_yaw_err_deg   : |yaw - target| at DONE (from DONE ROTATE kv)
+    #   - overshoot_angle_deg : peak signed overshoot beyond target
+    #   - oscillation_count   : heading sign-changes near target before settling
+    #   - rotation_time_s     : wall time from ACK to DONE
+    #
+    # TODO: implement _analyze_final_yaw() — metrics for small-angle correction:
+    #   - corrected_without_buzz : True if final hold reached without oscillation
+    #   - correction_time_s      : time to settle inside HEADING_TOLERANCE_DEG
+
     # ── Command dispatch ──────────────────────────────────────────────────
 
     def handle_line(self, line: str) -> None:
@@ -846,7 +1065,8 @@ class TestTuneNode(Node):
         # ── AUTO modes ────────────────────────────────────────────────
         if verb == "AUTO":
             if len(parts) < 3:
-                print("usage: AUTO ROT <angle> [count]  |  AUTO MOVE <dist> [count]  |  AUTO TRIP <dist> [count]")
+                print("usage: AUTO ROT <angle> [count]  |  AUTO MOVE <dist> [count]  |  "
+                      "AUTO TRIP <dist> [count]  |  AUTO VTEST <rpm> [duration_ms]")
                 return
             mode = parts[1]
             val = self._float(parts[2])
@@ -871,8 +1091,20 @@ class TestTuneNode(Node):
                     print("distance > 3 m blocked")
                     return
                 self._run_auto_loop(self._auto_trip, val, cnt)
+            elif mode == "VTEST":
+                # AUTO VTEST <rpm> [duration_ms=2000]
+                # Primary source for wheel velocity PID tuning (clean step input).
+                # Use AUTO MOVE/ROT to validate full-robot behaviour afterward.
+                duration_ms = int(self._float(parts[3]) or 2000) if len(parts) >= 4 else 2000
+                if duration_ms < 500 or duration_ms > 10000:
+                    print("duration_ms must be 500–10000")
+                    return
+                if abs(val) > 60.0:
+                    print("rpm > 60 blocked")
+                    return
+                self._run_auto_loop(self._auto_vtest, val, duration_ms)
             else:
-                print(f"unknown auto mode '{mode}'  (ROT / MOVE / TRIP)")
+                print(f"unknown auto mode '{mode}'  (ROT / MOVE / TRIP / VTEST)")
             return
 
         # ── Motion ────────────────────────────────────────────────────
@@ -891,6 +1123,22 @@ class TestTuneNode(Node):
         if verb in ("ROTATE", "STOP", "RESUME", "RESET", "STATUS",
                     "HEADING", "HINVERT", "RINVERT"):
             self._send(" ".join(parts))
+            return
+
+        # VTEST <rpm> [duration_ms=2000] — one-shot step test (no auto loop)
+        if verb == "VTEST":
+            if len(parts) < 2:
+                print("usage: VTEST <rpm> [duration_ms=2000]")
+                return
+            rpm_val = self._float(parts[1])
+            if rpm_val is None or abs(rpm_val) > 60.0:
+                print("invalid or unsafe rpm (max ±60)")
+                return
+            dur_ms = int(self._float(parts[2]) or 2000) if len(parts) >= 3 else 2000
+            if dur_ms < 500 or dur_ms > 10000:
+                print("duration_ms must be 500–10000")
+                return
+            self._send(f"VTEST {rpm_val:.1f} {dur_ms}")
             return
 
         # ── Scalar tune commands ──────────────────────────────────────
