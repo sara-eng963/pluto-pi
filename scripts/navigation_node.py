@@ -79,7 +79,7 @@ from std_msgs.msg import String
 
 
 STATIC_AVOIDANCE_SIDE_DISTANCE = 0.40
-STATIC_AVOIDANCE_FORWARD_DISTANCE = 0.40
+STATIC_AVOIDANCE_FORWARD_DISTANCE = 0.60
 FRUIT_EXIT_BACKUP_DISTANCE = 0.15
 OBSTACLE_IGNORE_DISTANCE_LEFT_THRESHOLD = 0.45
 OBSTACLE_IGNORE_STATUS_TIMEOUT_SEC = 0.25
@@ -296,6 +296,17 @@ class NavigationNode(Node):
             self.obstacle_event_callback,
             10,
         )
+
+        # ---- E-stop ----------------------------------------------------------
+        self.estop_active = False
+
+        self.e_stop_sub = self.create_subscription(
+            String,
+            "/e_stop",
+            self.e_stop_callback,
+            10,
+        )
+        # ---------------------------------------------------------------------
 
         # ---- Manual / autonomous mode ---------------------------------------
         self.robot_mode = "autonomous"   # "autonomous" | "manual"
@@ -896,6 +907,19 @@ class NavigationNode(Node):
 
         return self.current_executing_command.strip().upper().startswith("MOVE")
 
+    def e_stop_callback(self, msg: String):
+        event = msg.data.strip()
+
+        if event == "e_stop_pressed":
+            self.estop_active = True
+            self.get_logger().warn("E-STOP pressed — sending STOP.")
+            self.send_stop()
+
+        elif event == "e_stop_released":
+            self.estop_active = False
+            self.get_logger().warn("E-STOP released — sending RESUME.")
+            self.publish_command("RESUME")
+
     def send_stop(self):
         """
         Send STOP to ESP.
@@ -1016,6 +1040,10 @@ class NavigationNode(Node):
                 self.get_logger().warn("wait_for_ack: manual mode interrupt — aborting.")
                 return False
 
+            if self.estop_active:
+                self.get_logger().warn("wait_for_ack: e-stop active — aborting.")
+                return False
+
             if self.ack_received:
                 return True
 
@@ -1112,6 +1140,11 @@ class NavigationNode(Node):
             if self.manual_mode_interrupt:
                 self.get_logger().warn("wait_for_done: manual mode interrupt — aborting.")
                 return "FAILED"
+
+            if self.estop_active:
+                self.get_logger().warn("wait_for_done: e-stop active — waiting for release.")
+                rclpy.spin_once(self, timeout_sec=0.05)
+                continue
 
             if self.interrupt_requested and not self.static_avoidance_active:
                 return "INTERRUPTED"
@@ -1506,6 +1539,10 @@ class NavigationNode(Node):
             if self.manual_mode_interrupt:
                 self.get_logger().warn("wait_for_dynamic_clear_or_static: manual mode interrupt — aborting.")
                 return "STATIC"
+
+            if self.estop_active:
+                rclpy.spin_once(self, timeout_sec=0.05)
+                continue
 
             if self.static_blocked:
                 return "STATIC"

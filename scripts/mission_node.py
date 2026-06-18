@@ -54,7 +54,7 @@ class MissionNode(Node):
         self.fruit_poses = {
             "Apple": (1.24, 0.0, 0.0),
             "Orange": (1.24, 0.35, 0),
-            "Kiwi": (0.8, 1.4, 0),
+            "Kiwi": (1.24, 0.7, 0),
         }
 
         self.esp2_traffic_pub = self.create_publisher(
@@ -175,12 +175,37 @@ class MissionNode(Node):
         )
 
         self.current_traffic = None
+        self.pre_estop_traffic = None
+
+        self.e_stop_sub = self.create_subscription(
+            String,
+            "/e_stop",
+            self.e_stop_traffic_callback,
+            10,
+        )
+
         self.startup_default_timer = self.create_timer(
             1.0,
             self._send_startup_default_storage_position,
         )
 
+        self._rfid_flash_timer = None
+
         self.get_logger().info("Mission node started.")
+
+    def e_stop_traffic_callback(self, msg: String):
+        event = msg.data.strip()
+
+        if event == "e_stop_pressed":
+            self.pre_estop_traffic = self.current_traffic
+            self.current_traffic = None  # force _set_traffic to publish even if already R
+            self._set_traffic("R")
+
+        elif event == "e_stop_released":
+            restore = self.pre_estop_traffic if self.pre_estop_traffic is not None else "O"
+            self.current_traffic = None  # force publish
+            self._set_traffic(restore)
+            self.pre_estop_traffic = None
 
     def _publish_string(self, publisher, data: str, topic_name: str):
         msg = String()
@@ -280,7 +305,9 @@ class MissionNode(Node):
         self.destroy_timer(self.startup_default_timer)
         self.startup_default_timer = None
 
-        self.get_logger().info("Setting startup storage defaults: open lock, close lid, gripper open.")
+        self.get_logger().info("Setting startup storage defaults: homing, open lock, close lid, gripper open.")
+        self._set_traffic("O")
+        self._send_position_cmd(-3)
         self._send_gripper_cmd("open_lock")
         self._send_gripper_cmd("close_lid")
         self._send_gripper_cmd("open_gripper")
@@ -439,11 +466,13 @@ class MissionNode(Node):
                 self._storage_step("gripper", "open_lock", "opened lock"),
                 self._storage_step("gripper", "open_gripper", "opened gripper"),
                 self._storage_step("gripper", "close_gripper", "closed gripper"),
+                self._storage_step("gripper", "open_lock", "opened lock"),
                 self._storage_step("gripper", "open_lid", "opened lid"),
                 self._storage_step("position", 90, "position 90 reached"),
                 self._storage_step("gripper", "open_gripper", "opened gripper"),
                 self._storage_step("position", 0, "position 0 reached"),
                 self._storage_step("gripper", "close_lid", "closed lid"),
+                self._storage_step("gripper", "close_lock", "closed lock"),
             ],
         )
 
@@ -518,6 +547,7 @@ class MissionNode(Node):
 
         if self.valid_true_count >= self.VISION_MIN_TRUE:
             self.mission_state = "storing"
+            self._set_traffic("G")
             self._publish_mission_state()
             self._publish_mission_event(
                 "storing",
@@ -553,6 +583,7 @@ class MissionNode(Node):
             f"Vision FAIL: ordered={self.active_fruit}, detected={detected}. Returning to base."
         )
 
+        self._set_traffic("R")
         self.waiting_for_valid = False
         self._reset_valid_readings()
         self.storage_done_for_current_target = False
@@ -854,6 +885,9 @@ class MissionNode(Node):
                 "RFID verification failed after 3 attempts.",
                 0,
             )
+
+            self._set_traffic("R")
+            self._rfid_flash_timer = self.create_timer(3.0, self._rfid_flash_end)
             return
 
         self.get_logger().info("RFID verification passed.")
@@ -872,6 +906,13 @@ class MissionNode(Node):
 
         self._start_open_storage_thread()
 
+
+    def _rfid_flash_end(self):
+        if self._rfid_flash_timer is not None:
+            self._rfid_flash_timer.cancel()
+            self.destroy_timer(self._rfid_flash_timer)
+            self._rfid_flash_timer = None
+        self._set_traffic("O")
 
     def storage_close_request_callback(self, msg: String):
         order_id = msg.data.strip()
