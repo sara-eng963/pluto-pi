@@ -133,7 +133,7 @@ class MFRC522:
 
     def init_reader(self):
         self.write_reg(COMMAND_REG, PCD_SOFT_RESET)
-        time.sleep(0.05)
+        time.sleep(0.15)  # increased: 50 ms was too short when many nodes start together
 
         self.write_reg(T_MODE_REG, 0x8D)
         self.write_reg(T_PRESCALER_REG, 0x3E)
@@ -301,19 +301,19 @@ class RFIDNode(Node):
 
         self.reader = self._init_reader_with_retry()
 
-        version = self.reader.read_version()
-
         self.get_logger().info("RFID node started.")
         self.get_logger().info(f"RFID executable path: {os.path.abspath(__file__)}")
         self.get_logger().info(
             f"MFRC522 SPI bus={self.spi_bus}, device={self.spi_device}, speed={self.spi_speed_hz}"
         )
-        self.get_logger().info(f"MFRC522 VersionReg = 0x{version:02X}")
+        self.get_logger().info(f"MFRC522 VersionReg = 0x{self.reader.read_version():02X}")
         self.get_logger().info("Publishing scans to /mission/rfid_verification")
 
         self.last_uid = ""
         self.last_publish_time = 0.0
         self.poll_count = 0
+        self._consecutive_errors = 0
+        self._REINIT_THRESHOLD = 30  # reinit after 30 consecutive poll failures (~6 s at 5 Hz)
 
         period = 1.0 / max(self.poll_hz, 0.1)
         self.timer = self.create_timer(period, self.poll_once)
@@ -326,6 +326,12 @@ class RFIDNode(Node):
                     device=self.spi_device,
                     speed_hz=self.spi_speed_hz,
                 )
+                # Validate chip is actually responding — 0x00 / 0xFF means bad state
+                version = reader.read_version()
+                if version in (0x00, 0xFF):
+                    raise RuntimeError(
+                        f"MFRC522 VersionReg=0x{version:02X} — chip not responding (bad init state)"
+                    )
                 return reader
             except Exception as exc:
                 self.get_logger().warn(
@@ -357,6 +363,19 @@ class RFIDNode(Node):
         self.get_logger().info(f"RFID scanned: {uid_text}")
         self.get_logger().info(f"PUB /mission/rfid_verification: {msg.data}")
 
+    def _try_reinit(self):
+        self.get_logger().warn("RFID: reinitialising reader after consecutive failures...")
+        try:
+            self.reader.close()
+        except Exception:
+            pass
+        try:
+            self.reader = self._init_reader_with_retry()
+            self._consecutive_errors = 0
+            self.get_logger().info("RFID: reader reinitialised successfully.")
+        except Exception as exc:
+            self.get_logger().error(f"RFID: reinit failed: {exc}")
+
     def poll_once(self):
         self.poll_count += 1
 
@@ -364,10 +383,18 @@ class RFIDNode(Node):
             uid = self.reader.read_uid()
         except Exception as exc:
             self.get_logger().error(f"RFID poll error: {exc}")
+            self._consecutive_errors += 1
+            if self._consecutive_errors >= self._REINIT_THRESHOLD:
+                self._try_reinit()
             return
 
         if uid is None:
+            self._consecutive_errors += 1
+            if self._consecutive_errors >= self._REINIT_THRESHOLD:
+                self._try_reinit()
             return
+
+        self._consecutive_errors = 0
 
         uid_text = self.format_uid(uid)
         now = time.monotonic()
