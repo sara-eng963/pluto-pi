@@ -37,7 +37,7 @@ class VisionNode(Node):
         # Detection settings
         # =========================
         self.confidence_threshold = 0.70
-        self.confirm_required = 5
+        self.confirm_required = 15
 
         self.ordered_fruit = ""
         self.latest_mission_state = ""
